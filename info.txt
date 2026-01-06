@@ -1,0 +1,4 @@
+PicoRV32 RISC-V Demo
+
+A demonstration core featuring a PicoRV32 RISC-V CPU with text display output.
+Displays "Hello World!" on startup.

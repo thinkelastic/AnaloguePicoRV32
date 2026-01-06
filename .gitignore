@@ -1,0 +1,33 @@
+# Firmware build outputs
+src/firmware/*.o
+src/firmware/*.elf
+src/firmware/*.bin
+src/firmware/*.map
+src/firmware/*.lst
+src/firmware/*.mif
+
+# FPGA build outputs
+src/fpga/output_files/
+src/fpga/db/
+src/fpga/incremental_db/
+src/fpga/simulation/
+src/fpga/greybox_tmp/
+src/fpga/*.qws
+src/fpga/*.bak
+src/fpga/core/firmware.mif
+
+# Release build outputs
+release/
+
+# Build tools
+reverse_bits
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

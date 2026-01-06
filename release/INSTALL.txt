@@ -1,0 +1,52 @@
+Analogue Pocket Core Installation Instructions
+================================================
+
+Core: ThinkElastic.Homebrew
+
+Installation Steps:
+-------------------
+
+1. Insert your Analogue Pocket's SD card into your computer
+
+2. Copy the entire contents of this release folder to your SD card root
+   - Merge with existing folders if they exist
+
+3. Safely eject the SD card and insert it back into your Analogue Pocket
+
+4. Power on your Analogue Pocket
+
+5. Navigate to the "Cores" menu and select "ThinkElastic.Homebrew"
+
+Directory Structure:
+--------------------
+Your SD card should have this structure:
+
+SD Card Root/
++-- Assets/
+|   +-- homebrew/
+|       +-- common/
+|           +-- firmware.bin
++-- Cores/
+|   +-- ThinkElastic.Homebrew/
+|       +-- bitstream.rbf_r
+|       +-- core.json
+|       +-- video.json
+|       +-- audio.json
+|       +-- input.json
+|       +-- data.json
+|       +-- variants.json
+|       +-- interact.json
+|       +-- icon.bin
++-- Platforms/
+    +-- _images/
+    |   +-- homebrew.bin
+    +-- homebrew.json
+
+Troubleshooting:
+----------------
+- Make sure the SD card is formatted as exFAT
+- Ensure your Analogue Pocket firmware is version 1.1 or later
+- Check that all files copied correctly without errors
+
+For more information, visit:
+https://www.analogue.co/developer

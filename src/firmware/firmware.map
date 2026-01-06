@@ -1,0 +1,118 @@
+
+Discarded input sections
+
+ .text          0x00000000        0x0 main.o
+ .data          0x00000000        0x0 main.o
+ .bss           0x00000000        0x0 main.o
+ .text          0x00000000        0x0 terminal.o
+ .data          0x00000000        0x0 terminal.o
+ .bss           0x00000000        0x0 terminal.o
+ .text.term_setpos
+                0x00000000       0x4c terminal.o
+ .text.term_getpos
+                0x00000000        0xc terminal.o
+ .text.term_println
+                0x00000000       0x24 terminal.o
+ .text.term_puthex
+                0x00000000       0x64 terminal.o
+ .rodata.hex.0  0x00000000       0x11 terminal.o
+ .text          0x00000000        0x0 start.o
+ .data          0x00000000        0x0 start.o
+ .bss           0x00000000        0x0 start.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+RAM              0x00000000         0x00001000         xrw
+*default*        0x00000000         0xffffffff
+
+Linker script and memory map
+
+LOAD main.o
+LOAD terminal.o
+LOAD start.o
+
+.text           0x00000000      0x5f8
+ *(.text.start)
+ .text.start    0x00000000       0x28 start.o
+                0x00000000                _start
+ *(.text*)
+ .text.startup.main
+                0x00000028       0x30 main.o
+                0x00000028                main
+ .text.term_clear
+                0x00000058       0x20 terminal.o
+                0x00000058                term_clear
+ .text.term_init
+                0x00000078        0x8 terminal.o
+                0x00000078                term_init
+ .text.term_putchar
+                0x00000080       0xf0 terminal.o
+                0x00000080                term_putchar
+ .text.print_hex
+                0x00000170       0xa4 terminal.o
+ .text.term_puts
+                0x00000214       0x34 terminal.o
+                0x00000214                term_puts
+ .text.term_putdec
+                0x00000248       0xa0 terminal.o
+                0x00000248                term_putdec
+ .text.term_printf
+                0x000002e8      0x290 terminal.o
+                0x000002e8                term_printf
+ *(.rodata*)
+ .rodata.main.str1.4
+                0x00000578       0x7f main.o
+                                 0x52 (size before relaxing)
+ .rodata.print_hex.str1.4
+                0x000005f7       0x25 terminal.o
+ .rodata.term_printf.str1.4
+                0x000005f7        0x7 terminal.o
+                0x0000061c                        . = ALIGN (0x4)
+ *fill*         0x000005f7        0x1 
+
+.rela.dyn       0x000005f8        0x0
+ .rela.text.start
+                0x000005f8        0x0 main.o
+
+.data           0x000005f8        0x0
+                0x000005f8                        _data_start = .
+ *(.data*)
+                0x000005f8                        . = ALIGN (0x4)
+                0x000005f8                        _data_end = .
+
+.bss            0x000005f8        0x0
+                0x000005f8                        . = ALIGN (0x4)
+                0x000005f8                        _bss_start = .
+ *(.bss*)
+ *(COMMON)
+                0x000005f8                        . = ALIGN (0x4)
+                0x000005f8                        _bss_end = .
+                0x00001000                        _stack_top = (ORIGIN (RAM) + LENGTH (RAM))
+OUTPUT(firmware.elf elf32-littleriscv)
+
+.sbss.cursor_pos
+                0x000005f8        0x4
+ .sbss.cursor_pos
+                0x000005f8        0x4 terminal.o
+
+.comment        0x00000000       0x26
+ .comment       0x00000000       0x26 main.o
+                                 0x27 (size before relaxing)
+ .comment       0x00000026       0x27 terminal.o
+
+.note.GNU-stack
+                0x00000000        0x0
+ .note.GNU-stack
+                0x00000000        0x0 main.o
+ .note.GNU-stack
+                0x00000000        0x0 terminal.o
+
+.riscv.attributes
+                0x00000000       0x1c
+ .riscv.attributes
+                0x00000000       0x1c main.o
+ .riscv.attributes
+                0x0000001c       0x1c terminal.o
+ .riscv.attributes
+                0x00000038       0x1a start.o

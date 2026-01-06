@@ -1,0 +1,30 @@
+-- VRAM initialization with test pattern for 40x30 terminal
+-- "TEST" on first line, "ABCD" on second line
+-- Rest filled with spaces (0x20)
+
+WIDTH=32;
+DEPTH=300;
+
+ADDRESS_RADIX=DEC;
+DATA_RADIX=HEX;
+
+CONTENT BEGIN
+-- Row 0: "TEST" followed by spaces (T=0x54, E=0x45, S=0x53, T=0x54)
+0 : 54534554;
+-- Rest of row 0 (words 1-9): spaces
+[1..9] : 20202020;
+-- Row 1: "ABCD" followed by spaces (A=0x41, B=0x42, C=0x43, D=0x44)
+10 : 44434241;
+-- Rest of row 1 (words 11-19): spaces
+[11..19] : 20202020;
+-- Row 2: "1234" (1=0x31, 2=0x32, 3=0x33, 4=0x34)
+20 : 34333231;
+-- Rest of row 2: spaces
+[21..29] : 20202020;
+-- Row 3: "XXXX" pattern (X=0x58)
+30 : 58585858;
+-- Rest of row 3: spaces
+[31..39] : 20202020;
+-- Remaining rows: all spaces
+[40..299] : 20202020;
+END;
