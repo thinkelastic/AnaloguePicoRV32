@@ -231,7 +231,8 @@ assign port_ir_tx = 0;
 assign port_ir_rx_disable = 1;
 
 // bridge endianness
-assign bridge_endian_little = 0;
+// RISC-V (PicoRV32) is little-endian, so we need little-endian bridge writes
+assign bridge_endian_little = 1;
 
 // cart is unused, so set all level translators accordingly
 // directions are 0:IN, 1:OUT
@@ -285,15 +286,21 @@ assign cram1_we_n = 1;
 assign cram1_ub_n = 1;
 assign cram1_lb_n = 1;
 
-assign dram_a = 'h0;
-assign dram_ba = 'h0;
-assign dram_dq = {16{1'bZ}};
-assign dram_dqm = 'h0;
-assign dram_clk = 'h0;
-assign dram_cke = 'h0;
-assign dram_ras_n = 'h1;
-assign dram_cas_n = 'h1;
-assign dram_we_n = 'h1;
+// SDRAM word interface signals (directly matching io_sdram interface)
+reg             ram1_word_rd;
+reg             ram1_word_wr;
+reg     [23:0]  ram1_word_addr;
+reg     [31:0]  ram1_word_data;
+wire    [31:0]  ram1_word_q;
+wire            ram1_word_busy;
+
+// CPU to SDRAM interface (directly exposed for cpu_system to use)
+wire        cpu_sdram_rd;
+wire        cpu_sdram_wr;
+wire [23:0] cpu_sdram_addr;
+wire [31:0] cpu_sdram_wdata;
+wire [31:0] cpu_sdram_rdata;
+wire        cpu_sdram_busy;
 
 assign sram_a = 'h0;
 assign sram_dq = {16{1'bZ}};
@@ -308,24 +315,89 @@ assign aux_scl = 1'bZ;
 assign vpll_feed = 1'bZ;
 
 
-// for bridge write data, we just broadcast it to all bus devices
-// for bridge read data, we have to mux it
-// add your own devices here
+// Bridge read data mux
+reg     [31:0]  ram1_bridge_rd_data;
+
 always @(*) begin
     casex(bridge_addr)
     default: begin
         bridge_rd_data <= 0;
     end
-    32'h10xxxxxx: begin
-        // example
-        // bridge_rd_data <= example_device_data;
-        bridge_rd_data <= 0;
+    32'b000000xx_xxxxxxxx_xxxxxxxx_xxxxxxxx: begin
+        // SDRAM mapped at 0x00000000 - 0x03FFFFFF (64MB)
+        bridge_rd_data <= ram1_bridge_rd_data;
     end
     32'hF8xxxxxx: begin
         bridge_rd_data <= cmd_bridge_rd_data;
     end
     endcase
 end
+
+// Synchronize CPU SDRAM signals from 12.288 MHz to 74.25 MHz domain
+reg [2:0] cpu_sdram_rd_sync;
+reg [2:0] cpu_sdram_wr_sync;
+always @(posedge clk_74a) begin
+    cpu_sdram_rd_sync <= {cpu_sdram_rd_sync[1:0], cpu_sdram_rd};
+    cpu_sdram_wr_sync <= {cpu_sdram_wr_sync[1:0], cpu_sdram_wr};
+end
+wire cpu_sdram_rd_s = cpu_sdram_rd_sync[2];
+wire cpu_sdram_wr_s = cpu_sdram_wr_sync[2];
+
+// Synchronize dataslot_allcomplete for gating CPU access
+reg [2:0] dataslot_complete_sync;
+always @(posedge clk_74a) begin
+    dataslot_complete_sync <= {dataslot_complete_sync[1:0], dataslot_allcomplete};
+end
+wire dataslot_complete_s = dataslot_complete_sync[2];
+
+// Bridge writes to SDRAM - registered like the example
+// This is CRITICAL - uses clocked always block, not combinational assigns
+always @(posedge clk_74a) begin
+    ram1_word_rd <= 0;
+    ram1_word_wr <= 0;
+
+    if(bridge_wr) begin
+        casex(bridge_addr[31:24])
+        8'b000000xx: begin
+            // 64mbyte sdram mapped at 0x0
+            // the ram controller's word port is 32bit aligned
+            ram1_word_wr <= 1;
+            ram1_word_addr <= bridge_addr[25:2];
+            ram1_word_data <= bridge_wr_data;
+        end
+        endcase
+    end
+    if(bridge_rd) begin
+        casex(bridge_addr[31:24])
+        8'b000000xx: begin
+            // start new read
+            ram1_word_rd <= 1;
+            // convert from byte address to word address
+            ram1_word_addr <= bridge_addr[25:2];
+            // output the last value read. the requested value will be returned in time for the next read
+            ram1_bridge_rd_data <= ram1_word_q;
+        end
+        endcase
+    end
+
+    // CPU SDRAM access - ONLY after dataslot loading is complete
+    // This prevents interference during APF data loading
+    if(dataslot_complete_s && !bridge_wr && !bridge_rd) begin
+        if(cpu_sdram_rd_s) begin
+            ram1_word_rd <= 1;
+            ram1_word_addr <= cpu_sdram_addr;
+        end
+        if(cpu_sdram_wr_s) begin
+            ram1_word_wr <= 1;
+            ram1_word_addr <= cpu_sdram_addr;
+            ram1_word_data <= cpu_sdram_wdata;
+        end
+    end
+end
+
+// CPU reads SDRAM data
+assign cpu_sdram_rdata = ram1_word_q;
+assign cpu_sdram_busy = ram1_word_busy;
 
 
 //
@@ -383,31 +455,33 @@ end
 
 // bridge target commands
 // synchronous to clk_74a
+// We don't use target commands - APF loads data slots automatically via "address" field
 
-    reg             target_dataslot_read;       
-    reg             target_dataslot_write;
-    reg             target_dataslot_getfile;    // require additional param/resp structs to be mapped
-    reg             target_dataslot_openfile;   // require additional param/resp structs to be mapped
-    
-    wire            target_dataslot_ack;        
-    wire            target_dataslot_done;
-    wire    [2:0]   target_dataslot_err;
+    wire            target_dataslot_read       = 0;
+    wire            target_dataslot_write      = 0;
+    wire            target_dataslot_getfile    = 0;
+    wire            target_dataslot_openfile   = 0;
 
-    reg     [15:0]  target_dataslot_id;
-    reg     [31:0]  target_dataslot_slotoffset;
-    reg     [31:0]  target_dataslot_bridgeaddr;
-    reg     [31:0]  target_dataslot_length;
+    wire            target_dataslot_ack        = 0;
+    wire            target_dataslot_done       = 0;
+    wire    [2:0]   target_dataslot_err        = 0;
+
+    wire    [15:0]  target_dataslot_id         = 0;
+    wire    [31:0]  target_dataslot_slotoffset = 0;
+    wire    [31:0]  target_dataslot_bridgeaddr = 0;
+    wire    [31:0]  target_dataslot_length     = 0;
     
     wire    [31:0]  target_buffer_param_struct; // to be mapped/implemented when using some Target commands
     wire    [31:0]  target_buffer_resp_struct;  // to be mapped/implemented when using some Target commands
     
 // bridge data slot access
 // synchronous to clk_74a
+// Not used - APF handles data slot loading automatically
 
-    wire    [9:0]   datatable_addr;
-    wire            datatable_wren;
-    wire    [31:0]  datatable_data;
+    wire    [9:0]   datatable_addr = 0;
     wire    [31:0]  datatable_q;
+    wire            datatable_wren = 0;
+    wire    [31:0]  datatable_data = 0;
 
 core_bridge_cmd icb (
 
@@ -491,7 +565,6 @@ core_bridge_cmd icb (
 );
 
 
-
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -558,13 +631,23 @@ assign video_hs = vidout_hs;
     // PicoRV32 CPU system
     cpu_system cpu (
         .clk(clk_core_12288),
+        .clk_74a(clk_74a),
         .reset_n(reset_n),
+        .dataslot_allcomplete(dataslot_allcomplete),
+        // Terminal interface
         .term_mem_valid(term_mem_valid),
         .term_mem_addr(term_mem_addr),
         .term_mem_wdata(term_mem_wdata),
         .term_mem_wstrb(term_mem_wstrb),
         .term_mem_rdata(term_mem_rdata),
-        .term_mem_ready(term_mem_ready)
+        .term_mem_ready(term_mem_ready),
+        // SDRAM interface (directly to io_sdram word interface via core_top)
+        .sdram_rd(cpu_sdram_rd),
+        .sdram_wr(cpu_sdram_wr),
+        .sdram_addr(cpu_sdram_addr),
+        .sdram_wdata(cpu_sdram_wdata),
+        .sdram_rdata(cpu_sdram_rdata),
+        .sdram_busy(cpu_sdram_busy)
     );
 
     // Terminal display (40x30 characters, 320x240 pixels)
@@ -697,7 +780,10 @@ end
 
     wire    clk_core_12288;
     wire    clk_core_12288_90deg;
-    
+    wire    clk_ram_controller;
+    wire    clk_ram_chip;
+    wire    clk_ram_90;
+
     wire    pll_core_locked;
     wire    pll_core_locked_s;
 synch_3 s01(pll_core_locked, pll_core_locked_s, clk_74a);
@@ -705,13 +791,64 @@ synch_3 s01(pll_core_locked, pll_core_locked_s, clk_74a);
 mf_pllbase mp1 (
     .refclk         ( clk_74a ),
     .rst            ( 0 ),
-    
+
     .outclk_0       ( clk_core_12288 ),
     .outclk_1       ( clk_core_12288_90deg ),
-    
+
+    .outclk_2       ( clk_ram_controller ),
+    .outclk_3       ( clk_ram_chip ),
+    .outclk_4       ( clk_ram_90 ),
+
     .locked         ( pll_core_locked )
 );
 
 
-    
+// SDRAM controller using io_sdram from example
+// Uses word interface for both bridge writes and CPU access
+
+io_sdram isr0 (
+    .controller_clk ( clk_ram_controller ),
+    .chip_clk       ( clk_ram_chip ),
+    .clk_90         ( clk_ram_90 ),
+    .reset_n        ( 1'b1 ), // fsm has its own boot reset
+
+    .phy_cke        ( dram_cke ),
+    .phy_clk        ( dram_clk ),
+    .phy_cas        ( dram_cas_n ),
+    .phy_ras        ( dram_ras_n ),
+    .phy_we         ( dram_we_n ),
+    .phy_ba         ( dram_ba ),
+    .phy_a          ( dram_a ),
+    .phy_dq         ( dram_dq ),
+    .phy_dqm        ( dram_dqm ),
+
+    // Burst interface - not used
+    .burst_rd           ( 1'b0 ),
+    .burst_addr         ( 25'b0 ),
+    .burst_len          ( 11'b0 ),
+    .burst_32bit        ( 1'b0 ),
+    .burst_data         ( ),
+    .burst_data_valid   ( ),
+    .burst_data_done    ( ),
+
+    // Burst write interface - not used
+    .burstwr        ( 1'b0 ),
+    .burstwr_addr   ( 25'b0 ),
+    .burstwr_ready  ( ),
+    .burstwr_strobe ( 1'b0 ),
+    .burstwr_data   ( 16'b0 ),
+    .burstwr_done   ( 1'b0 ),
+
+    // Word interface - used for bridge writes and CPU access
+    .word_rd    ( ram1_word_rd ),
+    .word_wr    ( ram1_word_wr ),
+    .word_addr  ( ram1_word_addr ),
+    .word_data  ( ram1_word_data ),
+    .word_q     ( ram1_word_q ),
+    .word_busy  ( ram1_word_busy )
+
+);
+
+
+
 endmodule

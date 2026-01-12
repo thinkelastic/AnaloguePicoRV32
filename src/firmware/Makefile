@@ -1,4 +1,5 @@
 # PicoRV32 Firmware Makefile for Analogue Pocket
+# Supports llama2.c inference with SDRAM and data slot loading
 
 # Toolchain
 CROSS = riscv64-elf-
@@ -14,18 +15,37 @@ TARGET = firmware
 
 # Directories
 FPGA_CORE_DIR = ../fpga/core
+LIBC_DIR = libc
 
-# Source files
-SRCS_C = main.c terminal.c
+# Source files - Core
+SRCS_C = main.c terminal.c dataslot.c llama_embedded.c
+
+# Source files - libc
+LIBC_SRCS = $(LIBC_DIR)/memory.c \
+            $(LIBC_DIR)/string.c \
+            $(LIBC_DIR)/ctype.c \
+            $(LIBC_DIR)/stdlib.c \
+            $(LIBC_DIR)/qsort.c \
+            $(LIBC_DIR)/time.c \
+            $(LIBC_DIR)/math.c \
+            $(LIBC_DIR)/file.c
+
+# Assembly sources
 SRCS_S = start.S
-OBJS = $(SRCS_C:.c=.o) $(SRCS_S:.S=.o)
 
-# Compiler flags for RV32I (base integer only, no multiply/divide)
-ARCH = rv32i
+# All sources
+ALL_C_SRCS = $(SRCS_C) $(LIBC_SRCS)
+OBJS = $(ALL_C_SRCS:.c=.o) $(SRCS_S:.S=.o)
+
+# Compiler flags for RV32IM (with multiply/divide for better performance)
+# Using ilp32 ABI (soft-float is implicit since we're not using F extension)
+ARCH = rv32im
 ABI = ilp32
-CFLAGS = -march=$(ARCH) -mabi=$(ABI) -Os -Wall -Wextra
+CFLAGS = -march=$(ARCH) -mabi=$(ABI) -O2 -Wall -Wextra
 CFLAGS += -ffreestanding -nostdlib -nostartfiles
 CFLAGS += -ffunction-sections -fdata-sections
+CFLAGS += -fno-builtin
+CFLAGS += -I. -I$(LIBC_DIR)
 
 # Assembler flags
 ASFLAGS = -march=$(ARCH) -mabi=$(ABI)
@@ -36,13 +56,19 @@ LDFLAGS += -T linker.ld -nostdlib -nostartfiles
 LDFLAGS += -Wl,--gc-sections
 LDFLAGS += -Wl,-Map=$(TARGET).map
 
+# libgcc provides software floating-point routines (__addsf3, __mulsf3, etc.)
+LIBS = -lgcc
+
+# RAM size for MIF generation (64KB = 16384 words)
+RAM_WORDS = 16384
+
 # Default target
 all: $(TARGET).bin $(TARGET).mif $(TARGET).lst
 	$(SIZE) $(TARGET).elf
 
 # Link
 $(TARGET).elf: $(OBJS) linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
 # Binary output
 $(TARGET).bin: $(TARGET).elf
@@ -51,11 +77,11 @@ $(TARGET).bin: $(TARGET).elf
 # Quartus MIF output (Memory Initialization File)
 # Converts binary to MIF format for altsyncram initialization
 $(TARGET).mif: $(TARGET).bin
-	@echo "-- Firmware RAM initialization - 1024 x 32-bit words (4KB)" > $@
+	@echo "-- Firmware RAM initialization - $(RAM_WORDS) x 32-bit words (16KB)" > $@
 	@echo "-- Auto-generated from $(TARGET).bin" >> $@
 	@echo "" >> $@
 	@echo "WIDTH=32;" >> $@
-	@echo "DEPTH=1024;" >> $@
+	@echo "DEPTH=$(RAM_WORDS);" >> $@
 	@echo "" >> $@
 	@echo "ADDRESS_RADIX=DEC;" >> $@
 	@echo "DATA_RADIX=HEX;" >> $@
@@ -63,8 +89,8 @@ $(TARGET).mif: $(TARGET).bin
 	@echo "CONTENT BEGIN" >> $@
 	@hexdump -v -e '1/4 "%08X\n"' $< | awk '{printf "%d : %s;\n", NR-1, $$1}' >> $@
 	@LAST=$$(hexdump -v -e '1/4 "%08X\n"' $< | wc -l); \
-	if [ $$LAST -lt 1024 ]; then \
-		echo "[$$LAST..1023] : 00000013;" >> $@; \
+	if [ $$LAST -lt $(RAM_WORDS) ]; then \
+		echo "[$$LAST..$$(($(RAM_WORDS)-1))] : 00000013;" >> $@; \
 	fi
 	@echo "END;" >> $@
 	@echo "Generated $@ with $$(hexdump -v -e '1/4 "%08X\n"' $< | wc -l) words of firmware"
@@ -75,6 +101,10 @@ $(TARGET).lst: $(TARGET).elf
 
 # Compile C sources
 %.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Compile libc sources
+$(LIBC_DIR)/%.o: $(LIBC_DIR)/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Assemble assembly sources
@@ -93,4 +123,8 @@ clean:
 # Rebuild everything
 rebuild: clean all
 
-.PHONY: all clean rebuild install
+# Show memory usage
+mem: $(TARGET).elf
+	$(SIZE) -A -x $(TARGET).elf
+
+.PHONY: all clean rebuild install mem

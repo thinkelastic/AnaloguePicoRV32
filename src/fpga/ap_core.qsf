@@ -746,6 +746,7 @@ set_global_assignment -name MIF_FILE core/font_rom.mif
 set_global_assignment -name MIF_FILE core/vram_init.mif
 set_global_assignment -name MIF_FILE core/firmware.mif
 set_global_assignment -name VERILOG_FILE core/cpu_system.v
+set_global_assignment -name VERILOG_FILE core/io_sdram.v
 set_global_assignment -name VERILOG_FILE picorv32/picorv32.v
 set_global_assignment -name SDC_FILE core/core_constraints.sdc
 set_global_assignment -name SIGNALTAP_FILE core/stp1.stp
