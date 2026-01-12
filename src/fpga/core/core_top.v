@@ -333,25 +333,7 @@ always @(*) begin
     endcase
 end
 
-// Synchronize CPU SDRAM signals from 12.288 MHz to 74.25 MHz domain
-reg [2:0] cpu_sdram_rd_sync;
-reg [2:0] cpu_sdram_wr_sync;
-always @(posedge clk_74a) begin
-    cpu_sdram_rd_sync <= {cpu_sdram_rd_sync[1:0], cpu_sdram_rd};
-    cpu_sdram_wr_sync <= {cpu_sdram_wr_sync[1:0], cpu_sdram_wr};
-end
-wire cpu_sdram_rd_s = cpu_sdram_rd_sync[2];
-wire cpu_sdram_wr_s = cpu_sdram_wr_sync[2];
-
-// Synchronize dataslot_allcomplete for gating CPU access
-reg [2:0] dataslot_complete_sync;
-always @(posedge clk_74a) begin
-    dataslot_complete_sync <= {dataslot_complete_sync[1:0], dataslot_allcomplete};
-end
-wire dataslot_complete_s = dataslot_complete_sync[2];
-
-// Bridge writes to SDRAM - registered like the example
-// This is CRITICAL - uses clocked always block, not combinational assigns
+// Bridge and CPU writes to SDRAM - exactly like the example
 always @(posedge clk_74a) begin
     ram1_word_rd <= 0;
     ram1_word_wr <= 0;
@@ -359,8 +341,6 @@ always @(posedge clk_74a) begin
     if(bridge_wr) begin
         casex(bridge_addr[31:24])
         8'b000000xx: begin
-            // 64mbyte sdram mapped at 0x0
-            // the ram controller's word port is 32bit aligned
             ram1_word_wr <= 1;
             ram1_word_addr <= bridge_addr[25:2];
             ram1_word_data <= bridge_wr_data;
@@ -370,24 +350,20 @@ always @(posedge clk_74a) begin
     if(bridge_rd) begin
         casex(bridge_addr[31:24])
         8'b000000xx: begin
-            // start new read
             ram1_word_rd <= 1;
-            // convert from byte address to word address
             ram1_word_addr <= bridge_addr[25:2];
-            // output the last value read. the requested value will be returned in time for the next read
             ram1_bridge_rd_data <= ram1_word_q;
         end
         endcase
     end
 
-    // CPU SDRAM access - ONLY after dataslot loading is complete
-    // This prevents interference during APF data loading
-    if(dataslot_complete_s && !bridge_wr && !bridge_rd) begin
-        if(cpu_sdram_rd_s) begin
+    // CPU SDRAM access - directly sample signals (no synchronizers, like example)
+    if(dataslot_allcomplete && !bridge_wr && !bridge_rd) begin
+        if(cpu_sdram_rd) begin
             ram1_word_rd <= 1;
             ram1_word_addr <= cpu_sdram_addr;
         end
-        if(cpu_sdram_wr_s) begin
+        if(cpu_sdram_wr) begin
             ram1_word_wr <= 1;
             ram1_word_addr <= cpu_sdram_addr;
             ram1_word_data <= cpu_sdram_wdata;

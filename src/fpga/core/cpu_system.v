@@ -165,144 +165,92 @@ always @(*) begin
 end
 
 // ============================================
-// SDRAM Clock Domain Crossing
-// ============================================
-// CPU runs at 12.288 MHz, io_sdram word interface runs at ~133 MHz
-// The word interface in io_sdram has built-in synchronizers
-
-// SDRAM access state machine
-reg sdram_req_pending;
-reg sdram_wait_cycles;
-reg [3:0] sdram_wait_count;
-
-// SDRAM response data latched
-reg [31:0] sdram_resp_data;
-
-// Synchronize busy from SDRAM clock domain
-reg [2:0] sdram_busy_sync;
-always @(posedge clk) begin
-    sdram_busy_sync <= {sdram_busy_sync[1:0], sdram_busy};
-end
-wire sdram_busy_s = sdram_busy_sync[2];
-
-// Synchronize response data
-reg [31:0] sdram_rdata_sync;
-always @(posedge clk) begin
-    sdram_rdata_sync <= sdram_rdata;
-end
-
-// CPU clock domain: SDRAM request handling
-always @(posedge clk or negedge reset_n) begin
-    if (!reset_n) begin
-        sdram_rd <= 0;
-        sdram_wr <= 0;
-        sdram_addr <= 0;
-        sdram_wdata <= 0;
-        sdram_req_pending <= 0;
-        sdram_wait_cycles <= 0;
-        sdram_wait_count <= 0;
-        sdram_resp_data <= 0;
-    end else begin
-        // Default: deassert rd/wr pulses
-        sdram_rd <= 0;
-        sdram_wr <= 0;
-
-        if (sdram_wait_cycles) begin
-            // Wait for SDRAM access to complete
-            if (sdram_wait_count > 0) begin
-                sdram_wait_count <= sdram_wait_count - 1;
-            end else if (!sdram_busy_s) begin
-                // SDRAM is not busy, capture response
-                sdram_resp_data <= sdram_rdata_sync;
-                sdram_req_pending <= 0;
-                sdram_wait_cycles <= 0;
-            end
-        end else if (mem_valid && sdram_select && !sdram_req_pending && !mem_ready) begin
-            // New SDRAM request
-            sdram_addr <= mem_addr[25:2];  // Word address (byte addr >> 2)
-
-            if (|mem_wstrb) begin
-                // Write request
-                sdram_wr <= 1;
-                sdram_wdata <= mem_wdata;
-            end else begin
-                // Read request
-                sdram_rd <= 1;
-            end
-
-            sdram_req_pending <= 1;
-            sdram_wait_cycles <= 1;
-            sdram_wait_count <= 4'd10;  // Wait some cycles for CDC and SDRAM
-        end
-    end
-end
-
-// ============================================
 // Memory access state machine
 // ============================================
+// Simple approach like the example - no busy checking, just fixed wait cycles
+// 74.25 MHz / 12.288 MHz = ~6x clock ratio
+// SDRAM operations take ~10-20 cycles at 74.25 MHz, so wait ~15 CPU cycles
+
 reg mem_pending;
 reg ram_pending;
 reg term_pending;
 reg sdram_pending;
 reg sysreg_pending;
+reg [4:0] sdram_wait;
 
-always @(posedge clk) begin
-    mem_ready <= 0;
-
+always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
+        mem_ready <= 0;
+        mem_rdata <= 0;
         mem_pending <= 0;
         ram_pending <= 0;
         term_pending <= 0;
         sdram_pending <= 0;
         sysreg_pending <= 0;
-    end else if (mem_valid && !mem_ready && !mem_pending) begin
-        // Start of new memory access
-        if (ram_select) begin
-            // RAM access - need to wait 1 cycle for BRAM
-            mem_pending <= 1;
-            ram_pending <= 1;
-        end else if (sdram_select) begin
-            // SDRAM access - wait for completion
-            mem_pending <= 1;
-            sdram_pending <= 1;
-        end else if (term_select) begin
-            // Terminal access - wait for terminal module
-            mem_pending <= 1;
-            term_pending <= 1;
-        end else if (sysreg_select) begin
-            // System register - immediate response
-            mem_pending <= 1;
-            sysreg_pending <= 1;
-        end else begin
-            // Invalid address - return 0 immediately
-            mem_ready <= 1;
-            mem_rdata <= 32'h0;
+        sdram_rd <= 0;
+        sdram_wr <= 0;
+        sdram_addr <= 0;
+        sdram_wdata <= 0;
+        sdram_wait <= 0;
+    end else begin
+        mem_ready <= 0;
+        sdram_rd <= 0;
+        sdram_wr <= 0;
+
+        if (sdram_wait > 0) begin
+            sdram_wait <= sdram_wait - 1;
         end
-    end else if (mem_pending) begin
-        if (ram_pending) begin
-            // RAM data is now ready
-            mem_ready <= 1;
-            mem_rdata <= ram_rdata;
-            mem_pending <= 0;
-            ram_pending <= 0;
-        end else if (sdram_pending && !sdram_req_pending) begin
-            // SDRAM data is ready
-            mem_ready <= 1;
-            mem_rdata <= sdram_resp_data;
-            mem_pending <= 0;
-            sdram_pending <= 0;
-        end else if (term_pending && term_mem_ready) begin
-            // Terminal data is ready
-            mem_ready <= 1;
-            mem_rdata <= term_mem_rdata;
-            mem_pending <= 0;
-            term_pending <= 0;
-        end else if (sysreg_pending) begin
-            // System register - ready after 1 cycle
-            mem_ready <= 1;
-            mem_rdata <= sysreg_rdata;
-            mem_pending <= 0;
-            sysreg_pending <= 0;
+
+        if (mem_valid && !mem_ready && !mem_pending) begin
+            // Start of new memory access
+            if (ram_select) begin
+                mem_pending <= 1;
+                ram_pending <= 1;
+            end else if (sdram_select) begin
+                // SDRAM access - issue request and start wait counter
+                sdram_addr <= mem_addr[25:2];
+                if (|mem_wstrb) begin
+                    sdram_wr <= 1;
+                    sdram_wdata <= mem_wdata;
+                end else begin
+                    sdram_rd <= 1;
+                end
+                sdram_wait <= 5'd15;  // Wait 15 CPU cycles for SDRAM
+                mem_pending <= 1;
+                sdram_pending <= 1;
+            end else if (term_select) begin
+                mem_pending <= 1;
+                term_pending <= 1;
+            end else if (sysreg_select) begin
+                mem_pending <= 1;
+                sysreg_pending <= 1;
+            end else begin
+                mem_ready <= 1;
+                mem_rdata <= 32'h0;
+            end
+        end else if (mem_pending) begin
+            if (ram_pending) begin
+                mem_ready <= 1;
+                mem_rdata <= ram_rdata;
+                mem_pending <= 0;
+                ram_pending <= 0;
+            end else if (sdram_pending && sdram_wait == 0) begin
+                // SDRAM wait complete - data should be ready
+                mem_ready <= 1;
+                mem_rdata <= sdram_rdata;
+                mem_pending <= 0;
+                sdram_pending <= 0;
+            end else if (term_pending && term_mem_ready) begin
+                mem_ready <= 1;
+                mem_rdata <= term_mem_rdata;
+                mem_pending <= 0;
+                term_pending <= 0;
+            end else if (sysreg_pending) begin
+                mem_ready <= 1;
+                mem_rdata <= sysreg_rdata;
+                mem_pending <= 0;
+                sysreg_pending <= 0;
+            end
         end
     end
 end
