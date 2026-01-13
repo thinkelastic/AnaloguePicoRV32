@@ -55,7 +55,7 @@ firmware:
 	@echo "Firmware build complete"
 
 # Package release (uses existing bitstream)
-package: $(REVERSE_BITS) check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-firmware copy-icon install-txt
+package: $(REVERSE_BITS) check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-icon install-txt
 	@echo ""
 	@echo "Build complete!"
 	@echo "Release package: $(OUTPUT_DIR)/"
@@ -100,13 +100,6 @@ copy-platform:
 	@echo "Copying platform files..."
 	@cp dist/platforms/*.json $(RELEASE_PLATFORMS_DIR)/
 	@cp dist/platforms/_images/*.bin $(RELEASE_PLATFORMS_DIR)/_images/
-
-# Copy firmware if it exists
-copy-firmware:
-	@if [ -f "$(FIRMWARE_SOURCE)" ]; then \
-		echo "Copying firmware..."; \
-		cp $(FIRMWARE_SOURCE) $(FIRMWARE_TARGET); \
-	fi
 
 # Copy core icon if it exists
 copy-icon:
@@ -183,6 +176,21 @@ clean:
 	rm -f $(REVERSE_BITS)
 	$(MAKE) -C $(FIRMWARE_DIR) clean
 
+# Fast firmware update - only updates MIF in existing bitstream (no full recompile)
+# Use this when you only changed firmware and want a quick rebuild (~1 min vs ~15 min)
+firmware-update: firmware-mif
+	@echo "Updating MIF in existing bitstream..."
+	@if [ ! -f "$(FPGA_DIR)/output_files/$(QUARTUS_PROJECT).sof" ]; then \
+		echo "Error: No existing compile found. Run 'make fpga' first."; \
+		exit 1; \
+	fi
+	cd $(FPGA_DIR) && quartus_cdb --update_mif $(QUARTUS_PROJECT)
+	cd $(FPGA_DIR) && quartus_asm $(QUARTUS_PROJECT)
+	@echo "Firmware updated in bitstream"
+
+# Alias for firmware-update
+fw: firmware-update package
+
 # Clean Quartus cache (forces MIF files to be re-read)
 clean-fpga-cache:
 	@echo "Clearing Quartus cache to pick up MIF changes..."
@@ -196,4 +204,4 @@ clean-fpga: clean-fpga-cache
 # Quick target (alias for package)
 quick: package
 
-.PHONY: all full fpga firmware-mif firmware package check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-firmware copy-icon install-txt clean clean-fpga-cache clean-fpga quick
+.PHONY: all full fpga firmware-mif firmware firmware-update fw package check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-icon install-txt clean clean-fpga-cache clean-fpga quick

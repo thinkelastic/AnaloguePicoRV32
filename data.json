@@ -6,7 +6,7 @@
                 "id": 0,
                 "name": "Model Weights",
                 "required": true,
-                "parameters": "0x00",
+                "parameters": 0,
                 "extensions": [
                     "bin"
                 ],
@@ -17,7 +17,7 @@
                 "id": 1,
                 "name": "Tokenizer",
                 "required": true,
-                "parameters": "0x00",
+                "parameters": 0,
                 "extensions": [
                     "bin"
                 ],

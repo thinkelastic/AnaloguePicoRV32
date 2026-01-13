@@ -17,9 +17,26 @@
 /* Redirect printf to terminal */
 #define printf term_printf
 
+/* SDRAM arena for large allocations (RunState) - simple bump allocator */
+#define SDRAM_ARENA_ADDR      0x12100000                  /* After tokenizer data */
+#define SDRAM_ARENA_END       0x14000000                  /* End of 64MB SDRAM */
+static uint8_t* sdram_arena_ptr = (uint8_t*)SDRAM_ARENA_ADDR;
+
+/* Simple bump allocator for SDRAM - no free, just allocate sequentially */
+static void* sdram_alloc(size_t size) {
+    /* Align to 8 bytes */
+    size = (size + 7) & ~7;
+    if (sdram_arena_ptr + size > (uint8_t*)SDRAM_ARENA_END) {
+        return NULL;
+    }
+    void* ptr = sdram_arena_ptr;
+    sdram_arena_ptr += size;
+    return ptr;
+}
+
 /* Configuration - adjust these for your model */
 #define DEFAULT_STEPS       64      /* Max tokens to generate */
-#define DEFAULT_TEMPERATURE 0.8f
+#define DEFAULT_TEMPERATURE 0.0f  /* Use argmax for debugging */
 #define DEFAULT_TOPP        0.9f
 #define DEFAULT_PROMPT      "Once upon a time"
 
@@ -116,35 +133,30 @@ typedef struct {
 
 static void malloc_run_state(RunState* s, Config* p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    int kv_cache_size = p->n_layers * p->seq_len * kv_dim * sizeof(float);
+
+    printf("  RunState: kv_cache=%d x2\n", kv_cache_size);
+
+    s->x = sdram_alloc(p->dim * sizeof(float));
+    s->xb = sdram_alloc(p->dim * sizeof(float));
+    s->xb2 = sdram_alloc(p->dim * sizeof(float));
+    s->hb = sdram_alloc(p->hidden_dim * sizeof(float));
+    s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
+    s->q = sdram_alloc(p->dim * sizeof(float));
+    s->key_cache = sdram_alloc(kv_cache_size);
+    s->value_cache = sdram_alloc(kv_cache_size);
+    s->att = sdram_alloc(p->n_heads * p->seq_len * sizeof(float));
+    s->logits = sdram_alloc(p->vocab_size * sizeof(float));
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-        printf("ERROR: malloc failed for run state!\n");
+        printf("ERROR: sdram_alloc failed!\n");
         while(1);
     }
 }
 
 static void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->q);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    (void)s;  /* SDRAM bump allocator doesn't free */
 }
 
 /* ============================================
@@ -396,15 +408,18 @@ static inline float read_float(const uint8_t* ptr) {
     return result;
 }
 
+/* Static buffer in Block RAM for tokenizer copy - avoids SDRAM-to-SDRAM copy */
+static uint8_t tok_copy_bram[16384] __attribute__((aligned(4)));
+
 static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size) {
     t->vocab_size = vocab_size;
-    printf("  Allocating vocab arrays (%d tokens)...\n", vocab_size);
-    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
+    /* Use SDRAM for vocab arrays */
+    t->vocab = (char**)sdram_alloc(vocab_size * sizeof(char*));
+    t->vocab_scores = (float*)sdram_alloc(vocab_size * sizeof(float));
     t->sorted_vocab = NULL;
 
     if (!t->vocab || !t->vocab_scores) {
-        printf("  ERROR: Failed to allocate tokenizer arrays!\n");
+        printf("ERROR: tokenizer sdram_alloc failed!\n");
         return;
     }
 
@@ -413,77 +428,81 @@ static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size
         t->byte_pieces[i * 2 + 1] = '\0';
     }
 
-    uint8_t* ptr = (uint8_t*)data;
+    /* Use static buffer in Block RAM (not SDRAM heap) */
+    uint8_t* tok_copy = tok_copy_bram;
 
-    /* Read max_token_length (aligned at start) */
-    t->max_token_length = read_u32(ptr);
+    /* Bulk copy from SDRAM to BRAM */
+    volatile uint32_t* src32 = (volatile uint32_t*)data;
+    uint32_t* dst32 = (uint32_t*)tok_copy;
+    for (int i = 0; i < 16384 / 4; i++) {
+        dst32[i] = src32[i];
+    }
+
+    uint8_t* ptr = tok_copy;
+
+    /* Read max_token_length */
+    t->max_token_length = *(uint32_t*)ptr;
     ptr += 4;
-    printf("  Max token length: %d\n", t->max_token_length);
 
-    printf("  Loading tokens: \n");
     for (int i = 0; i < vocab_size; i++) {
-        if ((i & 0x7FF) == 0) {  /* Every 2048 tokens */
-            printf("%dk..", i >> 10);
-        }
+        if (i % 25 == 0) printf("%d.", i);
 
-        /* Read score (potentially unaligned) */
-        float score = read_float(ptr);
+        /* Read score */
+        float score;
+        memcpy(&score, ptr, 4);
         ptr += 4;
 
-        /* Read length (potentially unaligned) */
-        int len = (int)read_u32(ptr);
+        /* Read length */
+        int32_t len;
+        memcpy(&len, ptr, 4);
         ptr += 4;
 
-        /* Debug first 5 tokens only (to reduce overhead) */
-        if (i < 5) {
-            printf("\n    Token %d: len=%d ptr=0x%08X ",
-                   i, len, (uint32_t)ptr);
-        }
-
-        /* Sanity check on length */
-        if (len < 0 || len > 1000) {
-            printf("\n  ERROR: Invalid token length %d at token %d!\n", len, i);
-            printf("  Raw bytes at ptr-8: %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                   ptr[-8], ptr[-7], ptr[-6], ptr[-5], ptr[-4], ptr[-3], ptr[-2], ptr[-1]);
-            printf("  Raw bytes at ptr:   %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
+        if (len < 0 || len > 100) {
+            printf("\nERROR: bad len %d at tok %d\n", len, i);
             return;
         }
 
         t->vocab_scores[i] = score;
 
-        if (i < 5) printf("malloc..");
-        t->vocab[i] = (char*)malloc(len + 1);
+        /* Allocate word-aligned size for SDRAM */
+        int alloc_len = (len + 4) & ~3;  /* Round up to 4-byte boundary */
+        t->vocab[i] = (char*)sdram_alloc(alloc_len);
         if (!t->vocab[i]) {
-            printf("\n  ERROR: malloc(%d) failed at token %d!\n", len + 1, i);
+            printf("\nERROR: sdram_alloc(%d) failed at tok %d\n", alloc_len, i);
             return;
         }
 
-        if (i < 5) printf("memcpy..");
-        memcpy(t->vocab[i], ptr, len);
-        t->vocab[i][len] = '\0';
-        ptr += len;
-        if (i < 5) {
-            /* Print token string (safely, only printable chars) */
-            printf("OK '");
-            for (int j = 0; j < len && j < 10; j++) {
-                char c = t->vocab[i][j];
-                if (c >= 32 && c < 127) printf("%c", c);
-                else printf(".");
+        /* Copy using word writes to SDRAM */
+        volatile uint32_t* dst = (volatile uint32_t*)t->vocab[i];
+        int words = (len + 4) / 4;  /* Include null terminator */
+        for (int w = 0; w < words; w++) {
+            uint32_t word = 0;
+            for (int b = 0; b < 4; b++) {
+                int idx = w * 4 + b;
+                if (idx < len) {
+                    word |= ((uint32_t)ptr[idx]) << (b * 8);
+                }
+                /* Bytes beyond len stay 0 (null terminator) */
             }
-            printf("'\n");
+            dst[w] = word;
         }
+        ptr += len;
     }
-    printf("done\n");
+    printf(" done\n");
+
+    /* Debug: print token 405 in hex */
+    if (vocab_size > 405) {
+        printf("Token 405: ");
+        char* s = t->vocab[405];
+        for (int j = 0; s[j] && j < 10; j++) {
+            printf("%02X ", (unsigned char)s[j]);
+        }
+        printf("\n");
+    }
 }
 
 static void free_tokenizer(Tokenizer* t) {
-    for (int i = 0; i < t->vocab_size; i++) {
-        free(t->vocab[i]);
-    }
-    free(t->vocab);
-    free(t->vocab_scores);
-    if (t->sorted_vocab) free(t->sorted_vocab);
+    (void)t;  /* SDRAM bump allocator doesn't free */
 }
 
 static char* decode(Tokenizer* t, int prev_token, int token) {

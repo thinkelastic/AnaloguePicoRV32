@@ -231,7 +231,7 @@ assign port_ir_tx = 0;
 assign port_ir_rx_disable = 1;
 
 // bridge endianness
-// RISC-V (PicoRV32) is little-endian, so we need little-endian bridge writes
+// Set to 1 for little-endian (RISC-V native format)
 assign bridge_endian_little = 1;
 
 // cart is unused, so set all level translators accordingly

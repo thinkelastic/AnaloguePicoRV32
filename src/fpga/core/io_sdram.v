@@ -196,7 +196,7 @@ always @(posedge controller_clk) begin
         
         if(word_op) begin
             if(~enable_dq_read_toggle) begin
-                // even cycles 
+                // even cycles - match burst order for consistency
                 word_q[31:16] <= phy_dq;
             end else begin
                 // odd cycles
@@ -353,26 +353,26 @@ always @(posedge controller_clk) begin
         end 
     end
     ST_WRITE_2: begin
-        dc <= 0;    
-        
+        dc <= 0;
+
         phy_a <= addr[9:0]; // A0-A9 row address
         cmd <= CMD_WRITE;
         phy_dq_oe <= 1;
-        phy_dq_out <= word_data[31:16];//addr[15:0];//
+        phy_dq_out <= word_data_s[31:16];  // Match burst order for consistency
         addr <= addr + 1'b1;
-        
-        state <= ST_WRITE_3;    
+
+        state <= ST_WRITE_3;
     end
     ST_WRITE_3: begin
-        dc <= 0;    
-        
+        dc <= 0;
+
         phy_a <= addr[9:0]; // A0-A9 row address
         cmd <= CMD_WRITE;
         phy_dq_oe <= 1;
-        phy_dq_out <= word_data[15:0];//16'hABCD; //
+        phy_dq_out <= word_data_s[15:0];
         addr <= addr + 1'b1;
-        
-        state <= ST_WRITE_4;    
+
+        state <= ST_WRITE_4;
     end
     ST_WRITE_4: begin
         if(dc == TIMING_WRITE-1+1) begin
