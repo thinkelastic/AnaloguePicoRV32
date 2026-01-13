@@ -733,9 +733,16 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
+    printf("Encoding prompt...\n");
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int));
+    if (!prompt_tokens) {
+        printf("ERROR: malloc failed for prompt_tokens\n");
+        while(1);
+    }
+    printf("malloc OK, encoding...\n");
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    printf("Encoded %d tokens\n", num_prompt_tokens);
 
     if (num_prompt_tokens < 1) {
         printf("ERROR: expected at least 1 prompt token\n");
@@ -746,15 +753,19 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
     int next;
     int token = prompt_tokens[0];
     int pos = 0;
+    printf("Starting generation, first token=%d\n", token);
 
     while (pos < steps) {
+        printf("[%d]", pos);  /* Debug: show position */
         float* logits = forward(transformer, token, pos);
+        printf("f");  /* Debug: forward done */
 
         if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
         } else {
             next = sample(sampler, logits);
         }
+        printf("s%d", next);  /* Debug: show sampled token */
         pos++;
 
         if (next == 1) { break; }
