@@ -45,6 +45,8 @@ CFLAGS = -march=$(ARCH) -mabi=$(ABI) -O2 -Wall -Wextra
 CFLAGS += -ffreestanding -nostdlib -nostartfiles
 CFLAGS += -ffunction-sections -fdata-sections
 CFLAGS += -fno-builtin
+# PicoRV32 doesn't support unaligned access - ensure compiler knows this
+CFLAGS += -mstrict-align
 CFLAGS += -I. -I$(LIBC_DIR)
 
 # Assembler flags

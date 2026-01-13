@@ -368,11 +368,45 @@ static int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
+/* Helper to read potentially unaligned 32-bit little-endian value */
+static inline uint32_t read_u32(const uint8_t* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+
+    if ((addr & 3) == 0) {
+        /* 4-byte aligned: direct 32-bit read */
+        return *(const uint32_t*)ptr;
+    } else if ((addr & 1) == 0) {
+        /* 2-byte aligned: two 16-bit reads */
+        const uint16_t* p16 = (const uint16_t*)ptr;
+        return (uint32_t)p16[0] | ((uint32_t)p16[1] << 16);
+    } else {
+        /* Unaligned: four byte reads */
+        return (uint32_t)ptr[0] |
+               ((uint32_t)ptr[1] << 8) |
+               ((uint32_t)ptr[2] << 16) |
+               ((uint32_t)ptr[3] << 24);
+    }
+}
+
+/* Helper to read potentially unaligned float */
+static inline float read_float(const uint8_t* ptr) {
+    uint32_t bits = read_u32(ptr);
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
 static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size) {
     t->vocab_size = vocab_size;
+    printf("  Allocating vocab arrays (%d tokens)...\n", vocab_size);
     t->vocab = (char**)malloc(vocab_size * sizeof(char*));
     t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
     t->sorted_vocab = NULL;
+
+    if (!t->vocab || !t->vocab_scores) {
+        printf("  ERROR: Failed to allocate tokenizer arrays!\n");
+        return;
+    }
 
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
@@ -381,21 +415,66 @@ static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size
 
     uint8_t* ptr = (uint8_t*)data;
 
-    t->max_token_length = *((int*)ptr);
-    ptr += sizeof(int);
+    /* Read max_token_length (aligned at start) */
+    t->max_token_length = read_u32(ptr);
+    ptr += 4;
+    printf("  Max token length: %d\n", t->max_token_length);
 
+    printf("  Loading tokens: \n");
     for (int i = 0; i < vocab_size; i++) {
-        t->vocab_scores[i] = *((float*)ptr);
-        ptr += sizeof(float);
+        if ((i & 0x7FF) == 0) {  /* Every 2048 tokens */
+            printf("%dk..", i >> 10);
+        }
 
-        int len = *((int*)ptr);
-        ptr += sizeof(int);
+        /* Read score (potentially unaligned) */
+        float score = read_float(ptr);
+        ptr += 4;
 
+        /* Read length (potentially unaligned) */
+        int len = (int)read_u32(ptr);
+        ptr += 4;
+
+        /* Debug first 5 tokens only (to reduce overhead) */
+        if (i < 5) {
+            printf("\n    Token %d: len=%d ptr=0x%08X ",
+                   i, len, (uint32_t)ptr);
+        }
+
+        /* Sanity check on length */
+        if (len < 0 || len > 1000) {
+            printf("\n  ERROR: Invalid token length %d at token %d!\n", len, i);
+            printf("  Raw bytes at ptr-8: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   ptr[-8], ptr[-7], ptr[-6], ptr[-5], ptr[-4], ptr[-3], ptr[-2], ptr[-1]);
+            printf("  Raw bytes at ptr:   %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
+            return;
+        }
+
+        t->vocab_scores[i] = score;
+
+        if (i < 5) printf("malloc..");
         t->vocab[i] = (char*)malloc(len + 1);
+        if (!t->vocab[i]) {
+            printf("\n  ERROR: malloc(%d) failed at token %d!\n", len + 1, i);
+            return;
+        }
+
+        if (i < 5) printf("memcpy..");
         memcpy(t->vocab[i], ptr, len);
         t->vocab[i][len] = '\0';
         ptr += len;
+        if (i < 5) {
+            /* Print token string (safely, only printable chars) */
+            printf("OK '");
+            for (int j = 0; j < len && j < 10; j++) {
+                char c = t->vocab[i][j];
+                if (c >= 32 && c < 127) printf("%c", c);
+                else printf(".");
+            }
+            printf("'\n");
+        }
     }
+    printf("done\n");
 }
 
 static void free_tokenizer(Tokenizer* t) {
@@ -707,7 +786,8 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
 #define MODEL_SDRAM_ADDR      0x10000000                  /* Slot 0: bridge 0x00000000 */
 #define TOKENIZER_SDRAM_ADDR  0x12000000                  /* Slot 1: bridge 0x02000000 */
 #define HEAP_SDRAM_ADDR       0x12100000                  /* Heap start (after tokenizer) */
-#define HEAP_SIZE             (0x14000000 - HEAP_SDRAM_ADDR)  /* ~31MB for heap */
+#define SDRAM_END             0x14000000                  /* End of 64MB SDRAM */
+#define HEAP_SIZE             (SDRAM_END - HEAP_SDRAM_ADDR)  /* ~31MB for heap */
 
 void llama_main(void) {
     printf("llama2.c for Analogue Pocket\n");
@@ -755,8 +835,9 @@ void llama_main(void) {
     printf("  SDRAM write OK!\n");
 
     /* Initialize heap in SDRAM (after model and tokenizer regions) */
-    printf("Initializing heap at 0x%08X...\n", HEAP_SDRAM_ADDR);
+    printf("Initializing heap at 0x%08X, size %d bytes\n", HEAP_SDRAM_ADDR, HEAP_SIZE);
     heap_init((void*)HEAP_SDRAM_ADDR, HEAP_SIZE);
+    printf("Heap initialized: 0x%08X - 0x%08X\n", HEAP_SDRAM_ADDR, HEAP_SDRAM_ADDR + HEAP_SIZE);
 
     /* Data is now in SDRAM */
     void* model_data = (void*)MODEL_SDRAM_ADDR;
@@ -780,6 +861,11 @@ void llama_main(void) {
 
     /* Build tokenizer */
     printf("Building tokenizer...\n");
+
+    /* Verify tokenizer data is readable */
+    volatile uint32_t *tok_header = (volatile uint32_t *)TOKENIZER_SDRAM_ADDR;
+    printf("  Tokenizer header[0]: %d (max_token_len)\n", tok_header[0]);
+
     Tokenizer tokenizer;
     build_tokenizer_from_memory(&tokenizer, tokenizer_data, transformer.config.vocab_size);
 

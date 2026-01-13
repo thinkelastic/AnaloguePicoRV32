@@ -8,11 +8,12 @@
 module mf_pllbase (
 		input  wire  refclk,   //  refclk.clk
 		input  wire  rst,      //   reset.reset
-		output wire  outclk_0, // outclk0.clk
-		output wire  outclk_1, // outclk1.clk
-		output wire  outclk_2, // outclk2.clk
-		output wire  outclk_3, // outclk3.clk
-		output wire  outclk_4, // outclk4.clk
+		output wire  outclk_0, // outclk0.clk - 12.288 MHz video
+		output wire  outclk_1, // outclk1.clk - 12.288 MHz video 90deg
+		output wire  outclk_2, // outclk2.clk - 133 MHz SDRAM controller
+		output wire  outclk_3, // outclk3.clk - 133 MHz SDRAM chip
+		output wire  outclk_4, // outclk4.clk - 133 MHz SDRAM 90deg
+		output wire  outclk_5, // outclk5.clk - 36.3 MHz CPU
 		output wire  locked    //  locked.export
 	);
 
@@ -24,6 +25,7 @@ module mf_pllbase (
 		.outclk_2 (outclk_2), // outclk2.clk
 		.outclk_3 (outclk_3), // outclk3.clk
 		.outclk_4 (outclk_4), // outclk4.clk
+		.outclk_5 (outclk_5), // outclk5.clk
 		.locked   (locked)    //  locked.export
 	);
 

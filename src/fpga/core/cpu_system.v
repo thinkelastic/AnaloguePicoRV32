@@ -10,7 +10,7 @@
 `default_nettype none
 
 module cpu_system (
-    input wire clk,           // CPU clock (12.288 MHz)
+    input wire clk,           // CPU clock (36.3 MHz)
     input wire clk_74a,       // Bridge/SDRAM clock (74.25 MHz)
     input wire reset_n,
     input wire dataslot_allcomplete,  // All data slots loaded by APF
@@ -168,15 +168,15 @@ end
 // Memory access state machine
 // ============================================
 // Simple approach like the example - no busy checking, just fixed wait cycles
-// 74.25 MHz / 12.288 MHz = ~6x clock ratio
-// SDRAM operations take ~10-20 cycles at 74.25 MHz, so wait ~15 CPU cycles
+// 74.25 MHz / 36.3 MHz = ~2x clock ratio
+// SDRAM operations take ~10-20 cycles at 74.25 MHz, so wait ~45 CPU cycles
 
 reg mem_pending;
 reg ram_pending;
 reg term_pending;
 reg sdram_pending;
 reg sysreg_pending;
-reg [4:0] sdram_wait;
+reg [5:0] sdram_wait;
 
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -215,7 +215,7 @@ always @(posedge clk or negedge reset_n) begin
                 end else begin
                     sdram_rd <= 1;
                 end
-                sdram_wait <= 5'd15;  // Wait 15 CPU cycles for SDRAM
+                sdram_wait <= 6'd45;  // Wait 45 CPU cycles for SDRAM (3x clock)
                 mem_pending <= 1;
                 sdram_pending <= 1;
             end else if (term_select) begin

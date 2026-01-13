@@ -606,7 +606,7 @@ assign video_hs = vidout_hs;
 
     // PicoRV32 CPU system
     cpu_system cpu (
-        .clk(clk_core_12288),
+        .clk(clk_cpu),  // 24.576 MHz CPU clock
         .clk_74a(clk_74a),
         .reset_n(reset_n),
         .dataslot_allcomplete(dataslot_allcomplete),
@@ -759,6 +759,7 @@ end
     wire    clk_ram_controller;
     wire    clk_ram_chip;
     wire    clk_ram_90;
+    wire    clk_cpu;  // 36.3 MHz CPU clock (~3x original)
 
     wire    pll_core_locked;
     wire    pll_core_locked_s;
@@ -774,6 +775,7 @@ mf_pllbase mp1 (
     .outclk_2       ( clk_ram_controller ),
     .outclk_3       ( clk_ram_chip ),
     .outclk_4       ( clk_ram_90 ),
+    .outclk_5       ( clk_cpu ),
 
     .locked         ( pll_core_locked )
 );

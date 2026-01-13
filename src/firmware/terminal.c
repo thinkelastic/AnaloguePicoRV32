@@ -31,6 +31,18 @@ static int pos_to_col(int pos) {
     return pos;
 }
 
+// Scroll terminal up by one line
+static void term_scroll(void) {
+    // Copy each line to the line above
+    for (int i = 0; i < TERM_SIZE - TERM_COLS; i++) {
+        terminal[i] = terminal[i + TERM_COLS];
+    }
+    // Clear the bottom line
+    for (int i = TERM_SIZE - TERM_COLS; i < TERM_SIZE; i++) {
+        terminal[i] = ' ';
+    }
+}
+
 void term_init(void) {
     cursor_pos = 0;
     term_clear();
@@ -61,7 +73,9 @@ void term_putchar(char c) {
         int row = pos_to_row(cursor_pos);
         row++;
         if (row >= TERM_ROWS) {
-            row = 0;  // Wrap to top
+            // Scroll up and stay on bottom line
+            term_scroll();
+            row = TERM_ROWS - 1;
         }
         cursor_pos = row * TERM_COLS;
     } else if (c == '\r') {
@@ -83,7 +97,9 @@ void term_putchar(char c) {
         terminal[cursor_pos] = c;
         cursor_pos++;
         if (cursor_pos >= TERM_SIZE) {
-            cursor_pos = 0;  // Wrap to top
+            // Scroll up and position at start of last line
+            term_scroll();
+            cursor_pos = (TERM_ROWS - 1) * TERM_COLS;
         }
     }
     // Ignore other control characters
