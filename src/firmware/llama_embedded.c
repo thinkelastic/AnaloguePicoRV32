@@ -1,11 +1,11 @@
 /*
  * Llama-2 Inference for PicoRV32 on Analogue Pocket
  *
- * This is an embedded adaptation of llama2.c (karpathy/llama2.c)
+ * Clean adaptation of llama2.c (karpathy/llama2.c)
  * Modified to work with:
  *   - Data slot loading instead of file I/O
- *   - SDRAM for model weights and heap
- *   - Terminal output instead of stdout
+ *   - SDRAM for model weights (memory-mapped directly)
+ *   - Simple heap for RunState buffers
  *
  * Original: https://github.com/karpathy/llama2.c
  */
@@ -17,41 +17,34 @@
 /* Redirect printf to terminal */
 #define printf term_printf
 
-/* SDRAM arena for large allocations (RunState) - simple bump allocator */
-#define SDRAM_ARENA_ADDR      0x12100000                  /* After tokenizer data */
-#define SDRAM_ARENA_END       0x14000000                  /* End of 64MB SDRAM */
-static uint8_t* sdram_arena_ptr = (uint8_t*)SDRAM_ARENA_ADDR;
-
-/* Simple bump allocator for SDRAM - no free, just allocate sequentially */
-static void* sdram_alloc(size_t size) {
-    /* Align to 8 bytes */
-    size = (size + 7) & ~7;
-    if (sdram_arena_ptr + size > (uint8_t*)SDRAM_ARENA_END) {
-        return NULL;
-    }
-    void* ptr = sdram_arena_ptr;
-    sdram_arena_ptr += size;
-    return ptr;
-}
-
-/* Configuration - adjust these for your model */
-#define DEFAULT_STEPS       64      /* Max tokens to generate */
-#define DEFAULT_TEMPERATURE 0.0f  /* Use argmax for debugging */
+/* Configuration */
+#define DEFAULT_STEPS       64
+#define DEFAULT_TEMPERATURE 0.0f   /* Use argmax for debugging */
 #define DEFAULT_TOPP        0.9f
 #define DEFAULT_PROMPT      "Once upon a time"
+
+/* Memory map */
+#define MODEL_ADDR          0x10000000   /* Slot 0: model.bin in SDRAM */
+#define TOKENIZER_ADDR      0x12000000   /* Slot 1: tokenizer.bin in SDRAM */
+#define PSRAM_HEAP_ADDR     0x14000000   /* PSRAM base for heap/working memory */
+#define PSRAM_HEAP_SIZE     0x04000000   /* 64MB PSRAM available */
+
+/* Use PSRAM for heap instead of SDRAM */
+#define HEAP_ADDR           PSRAM_HEAP_ADDR
+#define HEAP_SIZE           PSRAM_HEAP_SIZE
 
 /* ============================================
  * Transformer model structures
  * ============================================ */
 
 typedef struct {
-    int dim;         /* Transformer dimension */
-    int hidden_dim;  /* FFN hidden dimension */
-    int n_layers;    /* Number of layers */
-    int n_heads;     /* Number of attention heads */
-    int n_kv_heads;  /* Number of KV heads (can be < n_heads for MQA) */
-    int vocab_size;  /* Vocabulary size */
-    int seq_len;     /* Max sequence length */
+    int dim;
+    int hidden_dim;
+    int n_layers;
+    int n_heads;
+    int n_kv_heads;
+    int vocab_size;
+    int seq_len;
 } Config;
 
 typedef struct {
@@ -128,35 +121,52 @@ typedef struct {
 } Sampler;
 
 /* ============================================
- * Memory allocation for run state
+ * RunState allocation
  * ============================================ */
 
 static void malloc_run_state(RunState* s, Config* p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_cache_size = p->n_layers * p->seq_len * kv_dim * sizeof(float);
+    printf("  kv_dim=%d\n", kv_dim);
 
-    printf("  RunState: kv_cache=%d x2\n", kv_cache_size);
+    /* Use malloc instead of calloc - calloc does memset which is very slow on SDRAM */
+    s->x = malloc(p->dim * sizeof(float));
+    s->xb = malloc(p->dim * sizeof(float));
+    s->xb2 = malloc(p->dim * sizeof(float));
+    s->hb = malloc(p->hidden_dim * sizeof(float));
+    s->hb2 = malloc(p->hidden_dim * sizeof(float));
+    s->q = malloc(p->dim * sizeof(float));
 
-    s->x = sdram_alloc(p->dim * sizeof(float));
-    s->xb = sdram_alloc(p->dim * sizeof(float));
-    s->xb2 = sdram_alloc(p->dim * sizeof(float));
-    s->hb = sdram_alloc(p->hidden_dim * sizeof(float));
-    s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
-    s->q = sdram_alloc(p->dim * sizeof(float));
-    s->key_cache = sdram_alloc(kv_cache_size);
-    s->value_cache = sdram_alloc(kv_cache_size);
-    s->att = sdram_alloc(p->n_heads * p->seq_len * sizeof(float));
-    s->logits = sdram_alloc(p->vocab_size * sizeof(float));
+    int kv_size = p->n_layers * p->seq_len * kv_dim;
+    printf("  kv_cache size: %d floats (%d KB)\n", kv_size, kv_size * 4 / 1024);
+    s->key_cache = malloc(kv_size * sizeof(float));
+    s->value_cache = malloc(kv_size * sizeof(float));
+
+    s->att = malloc(p->n_heads * p->seq_len * sizeof(float));
+    s->logits = malloc(p->vocab_size * sizeof(float));
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-        printf("ERROR: sdram_alloc failed!\n");
+        printf("malloc failed!\n");
+        printf("  x=%p xb=%p xb2=%p\n", s->x, s->xb, s->xb2);
+        printf("  hb=%p hb2=%p q=%p\n", s->hb, s->hb2, s->q);
+        printf("  key=%p val=%p\n", s->key_cache, s->value_cache);
+        printf("  att=%p logits=%p\n", s->att, s->logits);
         while(1);
     }
+    printf("  RunState allocated OK\n");
 }
 
 static void free_run_state(RunState* s) {
-    (void)s;  /* SDRAM bump allocator doesn't free */
+    free(s->x);
+    free(s->xb);
+    free(s->xb2);
+    free(s->hb);
+    free(s->hb2);
+    free(s->q);
+    free(s->att);
+    free(s->logits);
+    free(s->key_cache);
+    free(s->value_cache);
 }
 
 /* ============================================
@@ -166,7 +176,6 @@ static void free_run_state(RunState* s) {
 static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     unsigned long long n_layers = p->n_layers;
-
     w->token_embedding_table = ptr;
     ptr += p->vocab_size * p->dim;
     w->rms_att_weight = ptr;
@@ -195,40 +204,23 @@ static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int
 }
 
 /* ============================================
- * Build transformer from SDRAM data
+ * Build transformer from SDRAM
  * ============================================ */
 
-static void build_transformer_from_memory(Transformer *t, void* data, size_t size) {
-    printf("  Reading config from SDRAM...\n");
-    Config* config = (Config*)data;
-
-    printf("  Config ptr: 0x%08X\n", (uint32_t)config);
-    printf("  Reading dim...\n");
-    int dim = config->dim;
-    printf("  dim=%d\n", dim);
-
-    t->config = *config;
-
-    int shared_weights = config->vocab_size > 0 ? 1 : 0;
-    t->config.vocab_size = abs(config->vocab_size);
-
-    printf("  vocab_size=%d, shared=%d\n", t->config.vocab_size, shared_weights);
+static void build_transformer(Transformer *t, void* data) {
+    Config* config_ptr = (Config*)data;
+    t->config = *config_ptr;
+    int shared_weights = t->config.vocab_size > 0 ? 1 : 0;
+    t->config.vocab_size = abs(t->config.vocab_size);
 
     float* weights_ptr = (float*)((char*)data + sizeof(Config));
-    printf("  Mapping weights at 0x%08X...\n", (uint32_t)weights_ptr);
     memory_map_weights(&t->weights, &t->config, weights_ptr, shared_weights);
-
-    printf("  Allocating run state...\n");
     malloc_run_state(&t->state, &t->config);
-
     t->data = data;
-    t->file_size = size;
-    printf("  Transformer built.\n");
 }
 
 static void free_transformer(Transformer* t) {
     free_run_state(&t->state);
-    /* Don't free t->data - it's in SDRAM and managed elsewhere */
 }
 
 /* ============================================
@@ -251,9 +243,7 @@ static void rmsnorm(float* o, float* x, float* weight, int size) {
 static void softmax(float* x, int size) {
     float max_val = x[0];
     for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
+        if (x[i] > max_val) max_val = x[i];
     }
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
@@ -328,7 +318,6 @@ static float* forward(Transformer* transformer, int token, int pos) {
                 score /= sqrtf(head_size);
                 att[t] = score;
             }
-
             softmax(att, pos + 1);
 
             float* xb = s->xb + h * head_size;
@@ -380,149 +369,86 @@ static int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-/* Helper to read potentially unaligned 32-bit little-endian value */
-static inline uint32_t read_u32(const uint8_t* ptr) {
-    uintptr_t addr = (uintptr_t)ptr;
-
-    if ((addr & 3) == 0) {
-        /* 4-byte aligned: direct 32-bit read */
-        return *(const uint32_t*)ptr;
-    } else if ((addr & 1) == 0) {
-        /* 2-byte aligned: two 16-bit reads */
-        const uint16_t* p16 = (const uint16_t*)ptr;
-        return (uint32_t)p16[0] | ((uint32_t)p16[1] << 16);
-    } else {
-        /* Unaligned: four byte reads */
-        return (uint32_t)ptr[0] |
-               ((uint32_t)ptr[1] << 8) |
-               ((uint32_t)ptr[2] << 16) |
-               ((uint32_t)ptr[3] << 24);
-    }
-}
-
-/* Helper to read potentially unaligned float */
-static inline float read_float(const uint8_t* ptr) {
-    uint32_t bits = read_u32(ptr);
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
-}
-
-/* Static buffer in Block RAM for tokenizer copy - avoids SDRAM-to-SDRAM copy */
-static uint8_t tok_copy_bram[16384] __attribute__((aligned(4)));
-
-static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size) {
+static void build_tokenizer(Tokenizer* t, void* data, int vocab_size) {
     t->vocab_size = vocab_size;
-    /* Use SDRAM for vocab arrays */
-    t->vocab = (char**)sdram_alloc(vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)sdram_alloc(vocab_size * sizeof(float));
-    t->sorted_vocab = NULL;
-
-    if (!t->vocab || !t->vocab_scores) {
-        printf("ERROR: tokenizer sdram_alloc failed!\n");
-        return;
-    }
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL;  /* Built lazily in encode() */
 
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
     }
 
-    /* Use static buffer in Block RAM (not SDRAM heap) */
-    uint8_t* tok_copy = tok_copy_bram;
-
-    /* Bulk copy from SDRAM to BRAM */
-    volatile uint32_t* src32 = (volatile uint32_t*)data;
-    uint32_t* dst32 = (uint32_t*)tok_copy;
-    for (int i = 0; i < 16384 / 4; i++) {
-        dst32[i] = src32[i];
-    }
-
-    uint8_t* ptr = tok_copy;
+    /* Read tokenizer from SDRAM */
+    uint8_t* ptr = (uint8_t*)data;
 
     /* Read max_token_length */
-    t->max_token_length = *(uint32_t*)ptr;
-    ptr += 4;
+    memcpy(&t->max_token_length, ptr, sizeof(int));
+    ptr += sizeof(int);
 
+    printf("max_token_length=%d\n", t->max_token_length);
+
+    /* Read each token */
     for (int i = 0; i < vocab_size; i++) {
-        if (i % 25 == 0) printf("%d.", i);
-
         /* Read score */
-        float score;
-        memcpy(&score, ptr, 4);
-        ptr += 4;
+        memcpy(&t->vocab_scores[i], ptr, sizeof(float));
+        ptr += sizeof(float);
 
         /* Read length */
-        int32_t len;
-        memcpy(&len, ptr, 4);
-        ptr += 4;
+        int len;
+        memcpy(&len, ptr, sizeof(int));
+        ptr += sizeof(int);
 
-        if (len < 0 || len > 100) {
-            printf("\nERROR: bad len %d at tok %d\n", len, i);
-            return;
-        }
-
-        t->vocab_scores[i] = score;
-
-        /* Allocate word-aligned size for SDRAM */
-        int alloc_len = (len + 4) & ~3;  /* Round up to 4-byte boundary */
-        t->vocab[i] = (char*)sdram_alloc(alloc_len);
+        /* Allocate and read string */
+        t->vocab[i] = (char*)malloc(len + 1);
         if (!t->vocab[i]) {
-            printf("\nERROR: sdram_alloc(%d) failed at tok %d\n", alloc_len, i);
-            return;
+            printf("malloc failed for token %d\n", i);
+            while(1);
         }
-
-        /* Copy using word writes to SDRAM */
-        volatile uint32_t* dst = (volatile uint32_t*)t->vocab[i];
-        int words = (len + 4) / 4;  /* Include null terminator */
-        for (int w = 0; w < words; w++) {
-            uint32_t word = 0;
-            for (int b = 0; b < 4; b++) {
-                int idx = w * 4 + b;
-                if (idx < len) {
-                    word |= ((uint32_t)ptr[idx]) << (b * 8);
-                }
-                /* Bytes beyond len stay 0 (null terminator) */
-            }
-            dst[w] = word;
-        }
+        memcpy(t->vocab[i], ptr, len);
+        t->vocab[i][len] = '\0';
         ptr += len;
     }
-    printf(" done\n");
 
-    /* Debug: print token 405 in hex */
-    if (vocab_size > 405) {
-        printf("Token 405: ");
-        char* s = t->vocab[405];
-        for (int j = 0; s[j] && j < 10; j++) {
-            printf("%02X ", (unsigned char)s[j]);
-        }
-        printf("\n");
-    }
+    printf("Loaded %d tokens\n", vocab_size);
 }
 
 static void free_tokenizer(Tokenizer* t) {
-    (void)t;  /* SDRAM bump allocator doesn't free */
+    for (int i = 0; i < t->vocab_size; i++) {
+        free(t->vocab[i]);
+    }
+    free(t->vocab);
+    free(t->vocab_scores);
+    free(t->sorted_vocab);
 }
 
 static char* decode(Tokenizer* t, int prev_token, int token) {
     char *piece = t->vocab[token];
-    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+    if (prev_token == 1 && piece[0] == ' ') {
+        piece++;
+    }
+    /* Handle byte tokens like <0x0A> */
     unsigned char byte_val;
-    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+    if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x') {
+        /* Parse hex value */
+        byte_val = 0;
+        for (int i = 3; piece[i] != '>' && piece[i] != '\0'; i++) {
+            char c = piece[i];
+            if (c >= '0' && c <= '9') byte_val = (byte_val << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') byte_val = (byte_val << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') byte_val = (byte_val << 4) | (c - 'A' + 10);
+        }
         piece = (char*)t->byte_pieces + byte_val * 2;
     }
     return piece;
 }
 
 static void safe_printf(char *piece) {
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
+    if (piece == NULL || piece[0] == '\0') return;
     if (piece[1] == '\0') {
         unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return;
-        }
+        if (!(isprint(byte_val) || isspace(byte_val))) return;
     }
     printf("%s", piece);
 }
@@ -535,25 +461,30 @@ static int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
 
 static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     if (text == NULL) {
-        printf("ERROR: cannot encode NULL text\n");
+        printf("cannot encode NULL text\n");
         while(1);
     }
 
+    /* Lazily build sorted_vocab on first encode */
     if (t->sorted_vocab == NULL) {
+        printf("Sorting vocabulary...\n");
         t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
         }
         qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+        printf("Sort complete\n");
     }
 
-    char* str_buffer = malloc((t->max_token_length*2 + 1 + 2) * sizeof(char));
+    char* str_buffer = malloc((t->max_token_length * 2 + 3) * sizeof(char));
     size_t str_len = 0;
 
     *n_tokens = 0;
 
-    if (bos) tokens[(*n_tokens)++] = 1;
+    if (bos) {
+        tokens[(*n_tokens)++] = 1;
+    }
 
     if (text[0] != '\0') {
         int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
@@ -564,7 +495,6 @@ static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens
         if ((*c & 0xC0) != 0x80) {
             str_len = 0;
         }
-
         str_buffer[str_len++] = *c;
         str_buffer[str_len] = '\0';
 
@@ -573,7 +503,6 @@ static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens
         }
 
         int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-
         if (id != -1) {
             tokens[(*n_tokens)++] = id;
         } else {
@@ -584,13 +513,22 @@ static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens
         str_len = 0;
     }
 
+    /* BPE merge loop */
     while (1) {
         float best_score = -1e10;
         int best_id = -1;
         int best_idx = -1;
 
-        for (int i = 0; i < (*n_tokens-1); i++) {
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+        for (int i = 0; i < (*n_tokens - 1); i++) {
+            /* Build merged string using sprintf equivalent */
+            char *tok1 = t->vocab[tokens[i]];
+            char *tok2 = t->vocab[tokens[i+1]];
+            int len1 = strlen(tok1);
+            int len2 = strlen(tok2);
+            memcpy(str_buffer, tok1, len1);
+            memcpy(str_buffer + len1, tok2, len2);
+            str_buffer[len1 + len2] = '\0';
+
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
             if (id != -1 && t->vocab_scores[id] > best_score) {
                 best_score = t->vocab_scores[id];
@@ -599,18 +537,18 @@ static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens
             }
         }
 
-        if (best_idx == -1) {
-            break;
-        }
+        if (best_idx == -1) break;
 
         tokens[best_idx] = best_id;
-        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-            tokens[i] = tokens[i+1];
+        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
+            tokens[i] = tokens[i + 1];
         }
         (*n_tokens)--;
     }
 
-    if (eos) tokens[(*n_tokens)++] = 2;
+    if (eos) {
+        tokens[(*n_tokens)++] = 2;
+    }
 
     free(str_buffer);
 }
@@ -635,16 +573,14 @@ static int sample_mult(float* probabilities, int n, float coin) {
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
-        if (coin < cdf) {
-            return i;
-        }
+        if (coin < cdf) return i;
     }
     return n - 1;
 }
 
 static int compare_prob(const void* a, const void* b) {
-    ProbIndex* a_ = (ProbIndex*) a;
-    ProbIndex* b_ = (ProbIndex*) b;
+    ProbIndex* a_ = (ProbIndex*)a;
+    ProbIndex* b_ = (ProbIndex*)b;
     if (a_->prob > b_->prob) return -1;
     if (a_->prob < b_->prob) return 1;
     return 0;
@@ -676,9 +612,7 @@ static int sample_topp(float* probabilities, int n, float topp, ProbIndex* probi
     float cdf = 0.0f;
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
-        if (r < cdf) {
-            return probindex[i].index;
-        }
+        if (r < cdf) return probindex[i].index;
     }
     return probindex[last_idx].index;
 }
@@ -731,59 +665,45 @@ static int sample(Sampler* sampler, float* logits) {
 
 static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
     char *empty_prompt = "";
-    if (prompt == NULL) { prompt = empty_prompt; }
+    if (prompt == NULL) prompt = empty_prompt;
 
-    printf("Encoding prompt...\n");
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int));
-    if (!prompt_tokens) {
-        printf("ERROR: malloc failed for prompt_tokens\n");
-        while(1);
-    }
-    printf("malloc OK, encoding...\n");
+    int* prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int));
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    printf("Encoded %d tokens\n", num_prompt_tokens);
+
+    printf("Encoded %d tokens:", num_prompt_tokens);
+    for (int i = 0; i < num_prompt_tokens && i < 10; i++) {
+        printf(" %d", prompt_tokens[i]);
+    }
+    printf("\n");
 
     if (num_prompt_tokens < 1) {
-        printf("ERROR: expected at least 1 prompt token\n");
+        printf("expected at least 1 prompt token\n");
         while(1);
     }
 
-    long start = 0;
     int next;
     int token = prompt_tokens[0];
     int pos = 0;
-    printf("Starting generation, first token=%d\n", token);
 
+    printf("\n");
     while (pos < steps) {
-        printf("[%d]", pos);  /* Debug: show position */
         float* logits = forward(transformer, token, pos);
-        printf("f");  /* Debug: forward done */
 
         if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
         } else {
             next = sample(sampler, logits);
         }
-        printf("s%d", next);  /* Debug: show sampled token */
         pos++;
 
-        if (next == 1) { break; }
+        if (next == 1) break;
 
         char* piece = decode(tokenizer, token, next);
         safe_printf(piece);
         token = next;
-
-        if (start == 0) { start = time(NULL); }
     }
     printf("\n");
-
-    if (pos > 1) {
-        long end = time(NULL);
-        if (end > start) {
-            printf("Speed: %d tok/s\n", (int)((pos-1) / (end-start)));
-        }
-    }
 
     free(prompt_tokens);
 }
@@ -792,133 +712,268 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
  * Main entry point
  * ============================================ */
 
-/*
- * SDRAM Layout (64MB total):
- *
- * Bridge addresses (in data.json):     CPU addresses:
- * 0x00000000 ─────────────────────────► 0x10000000
- * │           MODEL DATA (~32MB max)        │
- * │     (APF auto-loads Slot 0 here)        │
- * │         stories15M.bin                  │
- * 0x02000000 ─────────────────────────► 0x12000000
- * │        TOKENIZER DATA (~1MB)            │
- * │     (APF auto-loads Slot 1 here)        │
- * │         tokenizer.bin (~424KB)          │
- * 0x02100000 ─────────────────────────► 0x12100000
- * │              HEAP ARENA                 │
- * │        (malloc/calloc/free)             │
- * │           ~31MB available               │
- * 0x03FFFFFF ─────────────────────────► 0x13FFFFFF
- *
- * APF loads to bridge addresses 0x00xxxxxx (from data.json).
- * CPU accesses SDRAM at 0x10xxxxxx (offset by 0x10000000).
- */
-#define MODEL_SDRAM_ADDR      0x10000000                  /* Slot 0: bridge 0x00000000 */
-#define TOKENIZER_SDRAM_ADDR  0x12000000                  /* Slot 1: bridge 0x02000000 */
-#define HEAP_SDRAM_ADDR       0x12100000                  /* Heap start (after tokenizer) */
-#define SDRAM_END             0x14000000                  /* End of 64MB SDRAM */
-#define HEAP_SIZE             (SDRAM_END - HEAP_SDRAM_ADDR)  /* ~31MB for heap */
+/* ============================================
+ * Comprehensive Memory Test
+ * ============================================ */
+
+static void memory_test(void) {
+    printf("=== SDRAM Memory Test ===\n\n");
+
+    volatile uint32_t* sdram = (volatile uint32_t*)MODEL_ADDR;
+    uint32_t errors = 0;
+    uint32_t tests = 0;
+
+    /* Test 1: Basic word write/read */
+    printf("Test 1: Basic word write/read\n");
+    for (uint32_t i = 0; i < 16; i++) {
+        uint32_t val = 0xDEAD0000 | i;
+        volatile uint32_t* ptr = (volatile uint32_t*)((uintptr_t)HEAP_ADDR + i * 4);
+        *ptr = val;
+        uint32_t read = *ptr;
+        tests++;
+        if (read != val) {
+            printf("  FAIL @%d: wrote %08X, read %08X\n", i, val, read);
+            errors++;
+        }
+    }
+    printf("  %d/%d passed\n", tests - errors, tests);
+
+    /* Test 2: Walking ones */
+    printf("Test 2: Walking ones pattern\n");
+    volatile uint32_t* test_addr = (volatile uint32_t*)(HEAP_ADDR + 0x100);
+    uint32_t walk_errors = 0;
+    for (int bit = 0; bit < 32; bit++) {
+        uint32_t pattern = 1 << bit;
+        *test_addr = pattern;
+        uint32_t read = *test_addr;
+        tests++;
+        if (read != pattern) {
+            printf("  FAIL bit %d: wrote %08X, read %08X\n", bit, pattern, read);
+            walk_errors++;
+            errors++;
+        }
+    }
+    printf("  %d/32 passed\n", 32 - walk_errors);
+
+    /* Test 3: Walking zeros */
+    printf("Test 3: Walking zeros pattern\n");
+    uint32_t walk0_errors = 0;
+    for (int bit = 0; bit < 32; bit++) {
+        uint32_t pattern = ~(1 << bit);
+        *test_addr = pattern;
+        uint32_t read = *test_addr;
+        tests++;
+        if (read != pattern) {
+            printf("  FAIL bit %d: wrote %08X, read %08X\n", bit, pattern, read);
+            walk0_errors++;
+            errors++;
+        }
+    }
+    printf("  %d/32 passed\n", 32 - walk0_errors);
+
+    /* Test 4: Address uniqueness - write unique values */
+    printf("Test 4: Address uniqueness (256 words)\n");
+    uint32_t addr_errors = 0;
+    volatile uint32_t* base = (volatile uint32_t*)(HEAP_ADDR + 0x200);
+    for (int i = 0; i < 256; i++) {
+        base[i] = 0xA5000000 | i;
+    }
+    for (int i = 0; i < 256; i++) {
+        uint32_t expected = 0xA5000000 | i;
+        uint32_t read = base[i];
+        tests++;
+        if (read != expected) {
+            if (addr_errors < 5) {
+                printf("  FAIL @%d: expected %08X, read %08X\n", i, expected, read);
+            }
+            addr_errors++;
+            errors++;
+        }
+    }
+    printf("  %d/256 passed\n", 256 - addr_errors);
+
+    /* Test 5: Byte ordering test */
+    printf("Test 5: Byte ordering\n");
+    volatile uint32_t* byte_test = (volatile uint32_t*)(HEAP_ADDR + 0x800);
+    *byte_test = 0x04030201;
+    uint32_t byte_read = *byte_test;
+    volatile uint8_t* bytes = (volatile uint8_t*)byte_test;
+    printf("  Wrote: 0x04030201\n");
+    printf("  Read:  0x%08X\n", byte_read);
+    printf("  Bytes: [0]=%02X [1]=%02X [2]=%02X [3]=%02X\n",
+           bytes[0], bytes[1], bytes[2], bytes[3]);
+    tests++;
+    if (byte_read != 0x04030201) {
+        printf("  FAIL: byte order mismatch!\n");
+        errors++;
+    }
+
+    /* Test 6: Sequential burst write/read */
+    printf("Test 6: Sequential burst (1KB)\n");
+    uint32_t burst_errors = 0;
+    volatile uint32_t* burst = (volatile uint32_t*)(HEAP_ADDR + 0x1000);
+    for (int i = 0; i < 256; i++) {
+        burst[i] = i * 0x01010101;
+    }
+    for (int i = 0; i < 256; i++) {
+        uint32_t expected = i * 0x01010101;
+        uint32_t read = burst[i];
+        tests++;
+        if (read != expected) {
+            if (burst_errors < 5) {
+                printf("  FAIL @%d: expected %08X, read %08X\n", i, expected, read);
+            }
+            burst_errors++;
+            errors++;
+        }
+    }
+    printf("  %d/256 passed\n", 256 - burst_errors);
+
+    /* Test 7: Random pattern */
+    printf("Test 7: Pseudo-random pattern (256 words)\n");
+    uint32_t rand_errors = 0;
+    volatile uint32_t* rand_base = (volatile uint32_t*)(HEAP_ADDR + 0x2000);
+    uint32_t seed = 0x12345678;
+    /* Write */
+    uint32_t r = seed;
+    for (int i = 0; i < 256; i++) {
+        r ^= r << 13;
+        r ^= r >> 17;
+        r ^= r << 5;
+        rand_base[i] = r;
+    }
+    /* Read and verify */
+    r = seed;
+    for (int i = 0; i < 256; i++) {
+        r ^= r << 13;
+        r ^= r >> 17;
+        r ^= r << 5;
+        uint32_t read = rand_base[i];
+        tests++;
+        if (read != r) {
+            if (rand_errors < 5) {
+                printf("  FAIL @%d: expected %08X, read %08X\n", i, r, read);
+            }
+            rand_errors++;
+            errors++;
+        }
+    }
+    printf("  %d/256 passed\n", 256 - rand_errors);
+
+    /* Test 8: Heap allocator test */
+    printf("Test 8: Heap allocator\n");
+    heap_init((void*)HEAP_ADDR, HEAP_SIZE);
+    int heap_errors = 0;
+
+    void* p1 = malloc(64);
+    void* p2 = malloc(128);
+    void* p3 = malloc(256);
+    printf("  malloc(64)  = %p\n", p1);
+    printf("  malloc(128) = %p\n", p2);
+    printf("  malloc(256) = %p\n", p3);
+
+    if (!p1 || !p2 || !p3) {
+        printf("  FAIL: malloc returned NULL\n");
+        heap_errors++;
+    } else {
+        /* Write to allocated memory */
+        memset(p1, 0xAA, 64);
+        memset(p2, 0xBB, 128);
+        memset(p3, 0xCC, 256);
+
+        /* Verify */
+        uint8_t* b1 = (uint8_t*)p1;
+        uint8_t* b2 = (uint8_t*)p2;
+        uint8_t* b3 = (uint8_t*)p3;
+
+        int ok = 1;
+        for (int i = 0; i < 64; i++) if (b1[i] != 0xAA) ok = 0;
+        for (int i = 0; i < 128; i++) if (b2[i] != 0xBB) ok = 0;
+        for (int i = 0; i < 256; i++) if (b3[i] != 0xCC) ok = 0;
+
+        if (!ok) {
+            printf("  FAIL: memory corruption detected\n");
+            heap_errors++;
+        } else {
+            printf("  Write/read OK\n");
+        }
+
+        free(p1);
+        free(p2);
+        free(p3);
+
+        /* Test reallocation */
+        void* p4 = malloc(64);
+        printf("  After free, malloc(64) = %p\n", p4);
+        if (!p4) {
+            printf("  FAIL: malloc after free failed\n");
+            heap_errors++;
+        }
+    }
+    tests += 4;
+    errors += heap_errors;
+
+    /* Test 9: Large allocation */
+    printf("Test 9: Large allocation (1MB)\n");
+    heap_init((void*)HEAP_ADDR, HEAP_SIZE);  /* Re-init heap */
+    void* big = malloc(1024 * 1024);
+    printf("  malloc(1MB) = %p\n", big);
+    if (!big) {
+        printf("  FAIL: large allocation failed\n");
+        errors++;
+    } else {
+        /* Write pattern to start, middle, end */
+        volatile uint32_t* bp = (volatile uint32_t*)big;
+        bp[0] = 0x11111111;
+        bp[1024*128] = 0x22222222;  /* Middle (512KB / 4) */
+        bp[1024*256 - 1] = 0x33333333;  /* End (1MB / 4 - 1) */
+
+        uint32_t r0 = bp[0];
+        uint32_t r1 = bp[1024*128];
+        uint32_t r2 = bp[1024*256 - 1];
+
+        printf("  Start:  wrote 11111111, read %08X\n", r0);
+        printf("  Middle: wrote 22222222, read %08X\n", r1);
+        printf("  End:    wrote 33333333, read %08X\n", r2);
+
+        if (r0 != 0x11111111 || r1 != 0x22222222 || r2 != 0x33333333) {
+            printf("  FAIL: data mismatch\n");
+            errors++;
+        }
+    }
+    tests++;
+
+    /* Summary */
+    printf("\n=== Summary ===\n");
+    printf("Total tests: %d\n", tests);
+    printf("Errors: %d\n", errors);
+    if (errors == 0) {
+        printf("ALL TESTS PASSED!\n");
+    } else {
+        printf("SOME TESTS FAILED!\n");
+    }
+}
 
 void llama_main(void) {
-    printf("llama2.c for Analogue Pocket\n");
-    printf("============================\n\n");
+    printf("PicoRV32 Memory Test\n");
+    printf("====================\n\n");
 
-    /* Wait for SDRAM to be ready */
+    /* Wait for SDRAM */
     printf("Waiting for SDRAM...\n");
-    while (!(SYS_STATUS & SYS_STATUS_SDRAM_READY)) {
-        /* Busy wait */
-    }
+    while (!(SYS_STATUS & SYS_STATUS_SDRAM_READY));
     printf("SDRAM ready.\n");
 
-    /* Wait for APF to finish loading all data slots */
+    /* Wait for data slots */
     printf("Waiting for data slots...\n");
     if (dataslot_wait_ready() != 0) {
-        printf("  ERROR: Timeout waiting for data slots!\n");
+        printf("Timeout waiting for data slots!\n");
         while(1);
     }
-    printf("Data slots loaded.\n");
+    printf("Data slots loaded.\n\n");
 
-    /* Simple SDRAM / data verification */
-    printf("Verifying model data...\n");
-    volatile uint32_t *model_header = (volatile uint32_t *)MODEL_SDRAM_ADDR;
-    uint32_t dim_check = model_header[0];  /* First field is 'dim' */
-    printf("  Model header[0] (dim): %d\n", dim_check);
+    /* Run memory test */
+    memory_test();
 
-    if (dim_check == 0 || dim_check > 10000) {
-        printf("  ERROR: Invalid model data!\n");
-        printf("  (Check that model.bin is in /Assets/homebrew/common/)\n");
-        while(1);
-    }
-    printf("  Model data verified!\n");
-
-    /* Test SDRAM write/read from CPU */
-    printf("Testing SDRAM write...\n");
-    volatile uint32_t *test_addr = (volatile uint32_t *)HEAP_SDRAM_ADDR;
-    uint32_t test_val = 0xDEADBEEF;
-    *test_addr = test_val;
-    uint32_t read_back = *test_addr;
-    printf("  Wrote 0x%08X, read back 0x%08X\n", test_val, read_back);
-    if (read_back != test_val) {
-        printf("  ERROR: SDRAM write failed!\n");
-        while(1);
-    }
-    printf("  SDRAM write OK!\n");
-
-    /* Initialize heap in SDRAM (after model and tokenizer regions) */
-    printf("Initializing heap at 0x%08X, size %d bytes\n", HEAP_SDRAM_ADDR, HEAP_SIZE);
-    heap_init((void*)HEAP_SDRAM_ADDR, HEAP_SIZE);
-    printf("Heap initialized: 0x%08X - 0x%08X\n", HEAP_SDRAM_ADDR, HEAP_SDRAM_ADDR + HEAP_SIZE);
-
-    /* Data is now in SDRAM */
-    void* model_data = (void*)MODEL_SDRAM_ADDR;
-    void* tokenizer_data = (void*)TOKENIZER_SDRAM_ADDR;
-
-    printf("Model at 0x%08X\n", (uint32_t)model_data);
-    printf("Tokenizer at 0x%08X\n", (uint32_t)tokenizer_data);
-
-    /* Build transformer from loaded data */
-    printf("Building transformer...\n");
-    Transformer transformer;
-    build_transformer_from_memory(&transformer, model_data, 0);  /* size not needed */
-
-    printf("Config: dim=%d, hidden=%d, layers=%d, heads=%d, vocab=%d, seq=%d\n",
-           transformer.config.dim,
-           transformer.config.hidden_dim,
-           transformer.config.n_layers,
-           transformer.config.n_heads,
-           transformer.config.vocab_size,
-           transformer.config.seq_len);
-
-    /* Build tokenizer */
-    printf("Building tokenizer...\n");
-
-    /* Verify tokenizer data is readable */
-    volatile uint32_t *tok_header = (volatile uint32_t *)TOKENIZER_SDRAM_ADDR;
-    printf("  Tokenizer header[0]: %d (max_token_len)\n", tok_header[0]);
-
-    Tokenizer tokenizer;
-    build_tokenizer_from_memory(&tokenizer, tokenizer_data, transformer.config.vocab_size);
-
-    /* Build sampler */
-    printf("Building sampler...\n");
-    Sampler sampler;
-    unsigned long long seed = SYS_CYCLE_LO;  /* Use cycle counter as seed */
-    build_sampler(&sampler, transformer.config.vocab_size, DEFAULT_TEMPERATURE, DEFAULT_TOPP, seed);
-
-    /* Run generation */
-    printf("\n--- Generating ---\n");
-    printf("Prompt: \"%s\"\n\n", DEFAULT_PROMPT);
-
-    generate(&transformer, &tokenizer, &sampler, (char*)DEFAULT_PROMPT, DEFAULT_STEPS);
-
-    /* Cleanup */
-    printf("\nCleaning up...\n");
-    free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
-
-    printf("Done!\n");
-
-    /* Halt */
+    printf("\nTest complete. Halting.\n");
     while(1);
 }

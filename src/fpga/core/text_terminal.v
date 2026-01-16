@@ -7,7 +7,8 @@
 `default_nettype none
 
 module text_terminal (
-    input wire clk,
+    input wire clk,           // Video clock (12.288 MHz)
+    input wire clk_cpu,       // CPU clock (74.25 MHz)
     input wire reset_n,
 
     // Video interface
@@ -83,8 +84,8 @@ altsyncram #(
     .wren_a(1'b0),
     .q_a(vram_video_data),
 
-    // Port B - CPU (read/write)
-    .clock1(clk),
+    // Port B - CPU (read/write) - uses CPU clock for proper CDC
+    .clock1(clk_cpu),
     .address_b(cpu_word_addr),
     .data_b(mem_wdata),
     .wren_b(mem_valid && !mem_ready && cpu_addr_valid && |mem_wstrb),
@@ -208,9 +209,10 @@ end
 
 // Memory interface for CPU - handle ready signal and read data
 // BRAM has 1 cycle read latency, so we need to delay ready
+// Uses clk_cpu to match CPU clock domain
 reg mem_pending;
 
-always @(posedge clk) begin
+always @(posedge clk_cpu) begin
     mem_ready <= 0;
 
     if (!reset_n) begin

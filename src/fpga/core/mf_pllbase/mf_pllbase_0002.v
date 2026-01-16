@@ -49,8 +49,8 @@ module  mf_pllbase_0002(
 		.output_clock_frequency4("133.119990 MHz"),
 		.phase_shift4("5634 ps"),
 		.duty_cycle4(50),
-		// CPU clock: 36.305452 MHz (~3x original speed)
-		.output_clock_frequency5("36.305452 MHz"),
+		// CPU clock: ~57 MHz (closest PLL achievable to openfpga-litex 57.12MHz)
+		.output_clock_frequency5("57.051425 MHz"),
 		.phase_shift5("0 ps"),
 		.duty_cycle5(50),
 		.output_clock_frequency6("0 MHz"),

@@ -293,6 +293,10 @@ reg     [23:0]  ram1_word_addr;
 reg     [31:0]  ram1_word_data;
 wire    [31:0]  ram1_word_q;
 wire            ram1_word_busy;
+wire            ram1_word_q_valid;
+
+// CPU runs at same clock as SDRAM controller (133 MHz) - no CDC needed!
+// Direct connection to ram1_word_q since same clock domain
 
 // CPU to SDRAM interface (directly exposed for cpu_system to use)
 wire        cpu_sdram_rd;
@@ -333,37 +337,71 @@ always @(*) begin
     endcase
 end
 
-// Bridge and CPU writes to SDRAM - exactly like the example
+// Synchronize bridge signals from clk_74a to clk_ram_controller
+reg bridge_wr_sync1, bridge_wr_sync2;
+reg bridge_rd_sync1, bridge_rd_sync2;
+reg [31:0] bridge_addr_captured;
+reg [31:0] bridge_wr_data_captured;
+reg bridge_sdram_wr, bridge_sdram_rd;
+
+// Capture bridge signals in clk_74a domain
 always @(posedge clk_74a) begin
-    ram1_word_rd <= 0;
-    ram1_word_wr <= 0;
+    bridge_sdram_wr <= 0;
+    bridge_sdram_rd <= 0;
 
     if(bridge_wr) begin
         casex(bridge_addr[31:24])
         8'b000000xx: begin
-            ram1_word_wr <= 1;
-            ram1_word_addr <= bridge_addr[25:2];
-            ram1_word_data <= bridge_wr_data;
+            bridge_sdram_wr <= 1;
+            bridge_addr_captured <= bridge_addr;
+            bridge_wr_data_captured <= bridge_wr_data;
         end
         endcase
     end
     if(bridge_rd) begin
         casex(bridge_addr[31:24])
         8'b000000xx: begin
-            ram1_word_rd <= 1;
-            ram1_word_addr <= bridge_addr[25:2];
-            ram1_bridge_rd_data <= ram1_word_q;
+            bridge_sdram_rd <= 1;
+            bridge_addr_captured <= bridge_addr;
+            ram1_bridge_rd_data <= ram1_word_q;  // Capture for bridge read (pipelined)
         end
         endcase
     end
+end
 
-    // CPU SDRAM access - directly sample signals (no synchronizers, like example)
-    if(dataslot_allcomplete && !bridge_wr && !bridge_rd) begin
-        if(cpu_sdram_rd) begin
+// Synchronize bridge request signals to RAM controller clock
+always @(posedge clk_ram_controller) begin
+    bridge_wr_sync1 <= bridge_sdram_wr;
+    bridge_wr_sync2 <= bridge_wr_sync1;
+    bridge_rd_sync1 <= bridge_sdram_rd;
+    bridge_rd_sync2 <= bridge_rd_sync1;
+end
+
+wire bridge_wr_active = bridge_wr_sync1 | bridge_wr_sync2;
+wire bridge_rd_active = bridge_rd_sync1 | bridge_rd_sync2;
+
+// SDRAM access arbiter - runs at SDRAM controller clock (133 MHz)
+// Bridge has priority, CPU runs when bridge is idle
+always @(posedge clk_ram_controller) begin
+    ram1_word_rd <= 0;
+    ram1_word_wr <= 0;
+
+    if (bridge_wr_sync1 && !bridge_wr_sync2) begin
+        // Rising edge of bridge write
+        ram1_word_wr <= 1;
+        ram1_word_addr <= bridge_addr_captured[25:2];
+        ram1_word_data <= bridge_wr_data_captured;
+    end else if (bridge_rd_sync1 && !bridge_rd_sync2) begin
+        // Rising edge of bridge read
+        ram1_word_rd <= 1;
+        ram1_word_addr <= bridge_addr_captured[25:2];
+    end else if (!bridge_wr_active && !bridge_rd_active) begin
+        // CPU SDRAM access - same clock domain, direct connection
+        if (cpu_sdram_rd) begin
             ram1_word_rd <= 1;
             ram1_word_addr <= cpu_sdram_addr;
         end
-        if(cpu_sdram_wr) begin
+        if (cpu_sdram_wr) begin
             ram1_word_wr <= 1;
             ram1_word_addr <= cpu_sdram_addr;
             ram1_word_data <= cpu_sdram_wdata;
@@ -371,7 +409,7 @@ always @(posedge clk_74a) begin
     end
 end
 
-// CPU reads SDRAM data
+// CPU reads SDRAM data - direct connection (same clock domain)
 assign cpu_sdram_rdata = ram1_word_q;
 assign cpu_sdram_busy = ram1_word_busy;
 
@@ -604,9 +642,9 @@ assign video_hs = vidout_hs;
     wire [31:0] term_mem_rdata;
     wire        term_mem_ready;
 
-    // PicoRV32 CPU system
+    // PicoRV32 CPU system - run at 133 MHz (same as SDRAM controller, no CDC needed)
     cpu_system cpu (
-        .clk(clk_cpu),  // 24.576 MHz CPU clock
+        .clk(clk_ram_controller),  // 133 MHz - same as SDRAM controller
         .clk_74a(clk_74a),
         .reset_n(reset_n),
         .dataslot_allcomplete(dataslot_allcomplete),
@@ -623,7 +661,8 @@ assign video_hs = vidout_hs;
         .sdram_addr(cpu_sdram_addr),
         .sdram_wdata(cpu_sdram_wdata),
         .sdram_rdata(cpu_sdram_rdata),
-        .sdram_busy(cpu_sdram_busy)
+        .sdram_busy(cpu_sdram_busy),
+        .sdram_rdata_valid(ram1_word_q_valid)
     );
 
     // Terminal display (40x30 characters, 320x240 pixels)
@@ -631,6 +670,7 @@ assign video_hs = vidout_hs;
 
     text_terminal terminal (
         .clk(clk_core_12288),
+        .clk_cpu(clk_ram_controller),  // CPU clock for memory interface (133 MHz)
         .reset_n(reset_n),
         .pixel_x(visible_x),
         .pixel_y(visible_y),
@@ -759,7 +799,7 @@ end
     wire    clk_ram_controller;
     wire    clk_ram_chip;
     wire    clk_ram_90;
-    wire    clk_cpu;  // 36.3 MHz CPU clock (~3x original)
+    wire    clk_cpu;  // 36.3 MHz CPU clock (unused - using clk_74a instead)
 
     wire    pll_core_locked;
     wire    pll_core_locked_s;
@@ -823,7 +863,8 @@ io_sdram isr0 (
     .word_addr  ( ram1_word_addr ),
     .word_data  ( ram1_word_data ),
     .word_q     ( ram1_word_q ),
-    .word_busy  ( ram1_word_busy )
+    .word_busy  ( ram1_word_busy ),
+    .word_q_valid ( ram1_word_q_valid )
 
 );
 

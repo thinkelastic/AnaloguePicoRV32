@@ -10,8 +10,8 @@
 `default_nettype none
 
 module cpu_system (
-    input wire clk,           // CPU clock (36.3 MHz)
-    input wire clk_74a,       // Bridge/SDRAM clock (74.25 MHz)
+    input wire clk,           // CPU clock (133 MHz - same as SDRAM controller)
+    input wire clk_74a,       // Bridge clock (74.25 MHz) - for APF interface
     input wire reset_n,
     input wire dataslot_allcomplete,  // All data slots loaded by APF
 
@@ -24,13 +24,14 @@ module cpu_system (
     input wire         term_mem_ready,
 
     // SDRAM word interface (directly to io_sdram via core_top)
-    // These signals cross to clk_74a domain in core_top
+    // CPU and SDRAM controller run at same clock (133 MHz)
     output reg         sdram_rd,
     output reg         sdram_wr,
     output reg  [23:0] sdram_addr,
     output reg  [31:0] sdram_wdata,
     input wire  [31:0] sdram_rdata,
-    input wire         sdram_busy
+    input wire         sdram_busy,
+    input wire         sdram_rdata_valid  // Pulses when read data is valid
 );
 
 // PicoRV32 signals
@@ -167,16 +168,17 @@ end
 // ============================================
 // Memory access state machine
 // ============================================
-// Simple approach like the example - no busy checking, just fixed wait cycles
-// 74.25 MHz / 36.3 MHz = ~2x clock ratio
-// SDRAM operations take ~10-20 cycles at 74.25 MHz, so wait ~45 CPU cycles
+// CPU now runs at 133 MHz (same as SDRAM controller) - no CDC issues!
+// For reads: wait for sdram_rdata_valid pulse
+// For writes: wait for busy to go HIGH then LOW (operation complete)
 
 reg mem_pending;
 reg ram_pending;
 reg term_pending;
-reg sdram_pending;
+reg sdram_read_pending;
+reg sdram_write_pending;
+reg sdram_write_started;  // Set when busy goes HIGH after write request
 reg sysreg_pending;
-reg [5:0] sdram_wait;
 
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -185,21 +187,18 @@ always @(posedge clk or negedge reset_n) begin
         mem_pending <= 0;
         ram_pending <= 0;
         term_pending <= 0;
-        sdram_pending <= 0;
+        sdram_read_pending <= 0;
+        sdram_write_pending <= 0;
+        sdram_write_started <= 0;
         sysreg_pending <= 0;
         sdram_rd <= 0;
         sdram_wr <= 0;
         sdram_addr <= 0;
         sdram_wdata <= 0;
-        sdram_wait <= 0;
     end else begin
         mem_ready <= 0;
         sdram_rd <= 0;
         sdram_wr <= 0;
-
-        if (sdram_wait > 0) begin
-            sdram_wait <= sdram_wait - 1;
-        end
 
         if (mem_valid && !mem_ready && !mem_pending) begin
             // Start of new memory access
@@ -207,17 +206,19 @@ always @(posedge clk or negedge reset_n) begin
                 mem_pending <= 1;
                 ram_pending <= 1;
             end else if (sdram_select) begin
-                // SDRAM access - issue request and start wait counter
+                // SDRAM access - CPU and SDRAM controller are on the same clock (133 MHz)
                 sdram_addr <= mem_addr[25:2];
                 if (|mem_wstrb) begin
                     sdram_wr <= 1;
                     sdram_wdata <= mem_wdata;
+                    mem_pending <= 1;
+                    sdram_write_pending <= 1;
+                    sdram_write_started <= 0;
                 end else begin
                     sdram_rd <= 1;
+                    mem_pending <= 1;
+                    sdram_read_pending <= 1;
                 end
-                sdram_wait <= 6'd45;  // Wait 45 CPU cycles for SDRAM (3x clock)
-                mem_pending <= 1;
-                sdram_pending <= 1;
             end else if (term_select) begin
                 mem_pending <= 1;
                 term_pending <= 1;
@@ -234,12 +235,23 @@ always @(posedge clk or negedge reset_n) begin
                 mem_rdata <= ram_rdata;
                 mem_pending <= 0;
                 ram_pending <= 0;
-            end else if (sdram_pending && sdram_wait == 0) begin
-                // SDRAM wait complete - data should be ready
+            end else if (sdram_read_pending && sdram_rdata_valid) begin
+                // Read complete - rdata_valid pulses when data is ready
                 mem_ready <= 1;
                 mem_rdata <= sdram_rdata;
                 mem_pending <= 0;
-                sdram_pending <= 0;
+                sdram_read_pending <= 0;
+            end else if (sdram_write_pending) begin
+                // Write: wait for busy to go HIGH (started) then LOW (complete)
+                if (!sdram_write_started && sdram_busy) begin
+                    sdram_write_started <= 1;
+                end else if (sdram_write_started && !sdram_busy) begin
+                    mem_ready <= 1;
+                    mem_rdata <= 32'h0;
+                    mem_pending <= 0;
+                    sdram_write_pending <= 0;
+                    sdram_write_started <= 0;
+                end
             end else if (term_pending && term_mem_ready) begin
                 mem_ready <= 1;
                 mem_rdata <= term_mem_rdata;
