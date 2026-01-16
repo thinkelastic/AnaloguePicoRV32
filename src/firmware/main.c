@@ -10,7 +10,7 @@ extern void llama_main(void);
 extern void memtest_main(void);
 
 /* Set to 1 for memory test, 0 for llama */
-#define RUN_MEMTEST 1
+#define RUN_MEMTEST 0
 
 int main(void) {
     term_init();

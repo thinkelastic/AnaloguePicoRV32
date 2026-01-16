@@ -122,5 +122,4 @@ void memtest_main(void) {
     }
 
     printf("\nDone.\n");
-    while(1);
 }
